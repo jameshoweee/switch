@@ -13,8 +13,14 @@ import switch_core.gateway.oidc_routes as oidc_routes
 from switch_core.config import SwitchConfig
 from switch_core.db.models import TENANT_ZERO_ID, OidcIdentity, TenantMember, User
 from switch_core.db.stores.user_store import OidcIdentityRaceError, UserStore
-from switch_core.gateway.auth import hash_password
+from switch_core.gateway.auth import decode_jwt, hash_password
 from switch_core.gateway.auth_routes import auth_config
+
+
+def _tenant_claim(set_cookie: str) -> str | None:
+    token = set_cookie.split("switch_auth=", 1)[1].split(";", 1)[0]
+    claim: str | None = decode_jwt(token, "secret").get("tenant_id")
+    return claim
 
 
 def _config(**overrides: object) -> SwitchConfig:
@@ -88,6 +94,12 @@ class TestOidcCallback:
             assert response.status_code == 303
             set_cookie = response.headers.get("set-cookie")
             assert set_cookie is not None and "switch_auth=" in set_cookie
+            # Signing in selects no workspace. That null claim is the recovery
+            # path out of a selection that has gone stale — a removed member is
+            # 403'd on every request until something mints one without it — so
+            # a later change carrying the previous tenant forward here would
+            # strand them until their cookie expired (CHOO-2723).
+            assert _tenant_claim(set_cookie) is None
 
             user = await UserStore().get_by_email(session, "alice@example.com")
             assert user is not None

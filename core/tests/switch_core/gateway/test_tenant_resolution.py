@@ -42,8 +42,9 @@ from types import SimpleNamespace
 from typing import Annotated
 
 import httpx
+import pytest
 import pytest_asyncio
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Response
 from sqlalchemy import insert, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -51,8 +52,19 @@ from switch_core.db.base import Base
 from switch_core.db.engine import create_session_factory
 from switch_core.db.models import TENANT_ZERO_ID, Tenant, TenantMember, User
 from switch_core.db.stores.user_store import UserStore
+from switch_core.gateway import auth as gw_auth
 from switch_core.gateway import dependencies as gw_deps
-from switch_core.gateway.auth import create_jwt, get_current_user
+from switch_core.gateway.auth import (
+    TENANT_MEMBERSHIP_UNRESOLVED,
+    TENANT_SELECTION_INVALID,
+    TENANT_SELECTION_REQUIRED,
+    create_jwt,
+    decode_jwt,
+    get_current_user,
+    hash_password,
+)
+from switch_core.gateway.auth_routes import login
+from switch_core.gateway.schemas import LoginRequest
 from switch_core.gateway.tenants import router as tenants_router
 
 _SECRET = "unit-test-jwt-key-unit-test-jwt-key-unit-test"  # gitleaks:allow
@@ -133,6 +145,23 @@ def _client(app: FastAPI, token: str) -> httpx.AsyncClient:
     )
 
 
+def _login_config() -> SimpleNamespace:
+    # The three attributes `login` reads.
+    return SimpleNamespace(
+        gateway_password_login_enabled=True,
+        jwt_secret_key=_SECRET,
+        gateway_cookie_secure=False,
+    )
+
+
+def _tenant_claim(response: Response) -> str | None:
+    raw = response.headers.get("set-cookie")
+    assert raw is not None, "no session cookie was minted"
+    token = raw.split("switch_auth=", 1)[1].split(";", 1)[0]
+    claim: str | None = decode_jwt(token, _SECRET).get("tenant_id")
+    return claim
+
+
 async def _make_user(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -174,6 +203,51 @@ async def _make_user_with_memberships(
             )
         await session.commit()
         return user.id
+
+
+class TestSigningInSelectsNoWorkspace:
+    """Both interactive mint sites pass a null tenant claim, and that is load
+    bearing rather than incidental.
+
+    It is the way out of a selection that has gone stale: a member removed
+    from the workspace their cookie names is 403'd
+    (`TENANT_SELECTION_INVALID`) on every request until something mints a
+    cookie without it. If either of these were later made to "helpfully"
+    carry the previous tenant forward, that person would be stranded until
+    their cookie expired — and the rest of the suite would stay green, since
+    only `/auth/refresh`'s claim is asserted anywhere else (CHOO-2723).
+    """
+
+    async def test_password_login_mints_no_tenant_claim(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            user = User(
+                name="signer",
+                email="signer@example.invalid",
+                role="user",
+                password_hash=hash_password("correct horse battery staple"),
+            )
+            session.add(user)
+            await session.flush()
+            session.add(
+                TenantMember(tenant_id=TENANT_ZERO_ID, user_id=user.id, role="member")
+            )
+            await session.commit()
+
+            response = Response()
+            await login(
+                LoginRequest(
+                    email="signer@example.invalid",
+                    password="correct horse battery staple",
+                ),
+                response,
+                session,
+                UserStore(),
+                _login_config(),
+            )
+
+        assert _tenant_claim(response) is None
 
 
 class TestAGatewayRequestBindsTheCallersTenant:
@@ -249,7 +323,12 @@ class TestAClaimSelectsAMembership:
             response = await client.get("/whoami")
 
         assert response.status_code == 403
-        assert "tenant" in response.json()["detail"]
+        detail = response.json()["detail"]
+        assert detail["error"] == TENANT_SELECTION_INVALID
+        # A caller in this state fixes it themselves — `GET /tenants` and the
+        # switch route both still work — so the message must not send them to
+        # an administrator. Member removal makes this the common 403.
+        assert "administrator" not in detail["message"]
         # The cookie is `lax`, so a cross-site navigation can reach this path;
         # clearing someone's selection off the back of a stale or forged
         # claim would be worse than just refusing (§4 of the design doc).
@@ -276,7 +355,7 @@ class TestNoClaimWithSeveralMemberships:
             response = await client.get("/whoami")
 
         assert response.status_code == 403
-        assert "tenant" in response.json()["detail"]
+        assert response.json()["detail"]["error"] == TENANT_MEMBERSHIP_UNRESOLVED
 
     async def test_flag_on_is_409_with_the_choices(
         self, session_factory: async_sessionmaker[AsyncSession]
@@ -290,8 +369,46 @@ class TestNoClaimWithSeveralMemberships:
             response = await client.get("/whoami")
 
         assert response.status_code == 409
-        tenant_ids = {choice["id"] for choice in response.json()["detail"]}
-        assert tenant_ids == {TENANT_ZERO_ID, TENANT_B}
+        detail = response.json()["detail"]
+        # Discriminated, because FastAPI's own validation failures are also
+        # `{"detail": [...]}` and 409 is a plausible status for some future
+        # conflict elsewhere in the API. A client branches on `error`, not on
+        # the shape of what it got.
+        assert detail["error"] == TENANT_SELECTION_REQUIRED
+        assert {choice["id"] for choice in detail["tenants"]} == {
+            TENANT_ZERO_ID,
+            TENANT_B,
+        }
+
+    async def test_the_choose_one_body_costs_no_second_lookup(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`_resolve_tenant_id` reads the exemption once and reuses the answer
+        for the 409's body. It is the function every authenticated request
+        goes through, and the case that builds a body is the one where a
+        second `SECURITY DEFINER` round trip would be easiest not to notice."""
+        calls = 0
+        real = gw_auth.tenants_of_user
+
+        async def counting(*args: object, **kwargs: object) -> list[str]:
+            nonlocal calls
+            calls += 1
+            return await real(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(gw_auth, "tenants_of_user", counting)
+
+        user_id = await _make_user_with_memberships(
+            session_factory, name="counted", tenant_ids=[TENANT_ZERO_ID, TENANT_B]
+        )
+        token = create_jwt(user_id, "counted@example.invalid", "user", _SECRET, None)
+
+        async with _client(_app(session_factory, choice_enabled=True), token) as client:
+            response = await client.get("/whoami")
+
+        assert response.status_code == 409
+        assert calls == 1
 
 
 class TestAUserWithNoMembership:
@@ -316,8 +433,8 @@ class TestAUserWithNoMembership:
 
         assert response.status_code == 403
         detail = response.json()["detail"]
-        assert "tenant" in detail
-        assert user_id not in detail
+        assert detail["error"] == TENANT_MEMBERSHIP_UNRESOLVED
+        assert user_id not in detail["message"]
 
 
 class TestConcurrentRequests:

@@ -32,6 +32,15 @@ logger = logging.getLogger(__name__)
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 24
 
+# The `error` discriminator on the three tenant-resolution failures a client
+# has to tell apart. A bare `{"detail": [...]}` is indistinguishable from
+# FastAPI's own validation failures, and the status code alone does not
+# separate "choose a workspace" from "the one you chose is gone" — both of
+# which the caller can fix without help, unlike the third.
+TENANT_SELECTION_REQUIRED = "tenant_selection_required"
+TENANT_SELECTION_INVALID = "tenant_selection_invalid"
+TENANT_MEMBERSHIP_UNRESOLVED = "tenant_membership_unresolved"
+
 
 def hash_password(password: str) -> str:
     result: bytes = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
@@ -166,29 +175,29 @@ async def is_tenant_member(
     return tenant_id in await tenants_of_user(session_factory, user_id)
 
 
-async def list_tenant_memberships(
+async def _describe_memberships(
     session_factory: async_sessionmaker[AsyncSession],
     user_store: UserStore,
     user_id: str,
+    tenant_ids: list[str],
 ) -> list[TenantMembershipResponse]:
-    """Every tenant `user_id` belongs to: id, slug, name, and their role in it.
+    """Name and role for each of `tenant_ids`, as the caller holds them.
 
-    Backs `GET /tenants`, and the body of the 409 `_resolve_tenant_id` raises
-    when there is no claim to bind and several memberships to choose from —
-    the same question asked at a different moment
-    (`docs/old/multi-tenancy-phase2-tenants.md`, §7).
+    Takes the ids rather than looking them up so the one caller that already
+    has them — `_resolve_tenant_id`, which reads them to decide the case it is
+    in — does not ask the exemption a second question it already knows the
+    answer to.
 
-    Never holds two connections at once. `tenants_of_user` is its own
-    short session with nothing bound; each tenant after that is read on its
-    own short `tenant_session`, opened and closed before the next one starts.
-    A request reaching this has no other session open — `get_current_user` is
-    exactly what this exists to run *before* — so nothing here needs the
-    guarantee, but the shape is worth keeping anyway: looping bound sessions
-    from inside a request that already holds one is the mistake this design
-    explicitly rejects.
+    Never holds two connections at once: each tenant is read on its own short
+    `tenant_session`, opened and closed before the next one starts. A request
+    reaching this has no other session open — `get_current_user` is exactly
+    what this exists to run *before* — so nothing here needs the guarantee,
+    but the shape is worth keeping anyway: looping bound sessions from inside
+    a request that already holds one is the mistake this design explicitly
+    rejects.
     """
     memberships: list[TenantMembershipResponse] = []
-    for tenant_id in await tenants_of_user(session_factory, user_id):
+    for tenant_id in tenant_ids:
         async with tenant_session(session_factory, tenant_id) as session:
             tenant = await session.get(Tenant, tenant_id)
             role = await user_store.tenant_role(session, tenant_id, user_id)
@@ -212,6 +221,26 @@ async def list_tenant_memberships(
     return memberships
 
 
+async def list_tenant_memberships(
+    session_factory: async_sessionmaker[AsyncSession],
+    user_store: UserStore,
+    user_id: str,
+) -> list[TenantMembershipResponse]:
+    """Every tenant `user_id` belongs to: id, slug, name, and their role in it.
+
+    Backs `GET /tenants`. `_resolve_tenant_id` builds the same list for the
+    409 it raises — the same question asked at a different moment
+    (`docs/old/multi-tenancy-phase2-tenants.md`, §7) — but goes straight to
+    `_describe_memberships` with ids it has already read.
+    """
+    return await _describe_memberships(
+        session_factory,
+        user_store,
+        user_id,
+        await tenants_of_user(session_factory, user_id),
+    )
+
+
 async def _resolve_tenant_id(
     session_factory: async_sessionmaker[AsyncSession],
     user_store: UserStore,
@@ -223,23 +252,33 @@ async def _resolve_tenant_id(
     `docs/old/multi-tenancy-phase2-tenants.md`, §4:
 
     1. A claim naming a tenant the caller belongs to → bind it.
-    2. A claim naming a tenant the caller does not belong to → 403. The cookie
-       is not cleared here: it is `lax`, so a cross-site navigation can reach
-       this path, and any page resetting someone's selection on a stale or
-       forged claim would be a worse failure than answering 403 and leaving
-       the session alone. Clearing belongs on a dedicated endpoint.
+    2. A claim naming a tenant the caller does not belong to → 403
+       `tenant_selection_invalid`. The caller can fix this unaided — `GET
+       /tenants` and `POST /tenants/{id}/switch` both authenticate without
+       binding a tenant, and signing in again mints a null claim — so the
+       message says so rather than sending them to an administrator. It is
+       not a rare state either: removing a member puts everyone it touches
+       here on their next request.
+
+       The cookie is not cleared here: it is `lax`, so a cross-site
+       navigation can reach this path, and any page resetting someone's
+       selection on a stale or forged claim would be a worse failure than
+       answering 403 and leaving the session alone. Clearing belongs on a
+       dedicated endpoint.
     3. No claim, exactly one membership → bind it. Every session issued before
        this change, and every single-workspace account forever, lands here.
-    4. No claim, several memberships → the choose-one response, gated on
-       `choice_enabled` because it is a breaking change for a client that has
-       never had to handle it. Off, this falls through to the same 403 as
-       case 5 — the exact behaviour every account had before this change,
-       since two memberships did not exist for anyone to reach it.
-    5. No memberships → 403.
+    4. No claim, several memberships → 409 `tenant_selection_required`
+       carrying the choices, gated on `choice_enabled` because it is a
+       breaking change for a client that has never had to handle it. Off,
+       this falls through to the same 403 as case 5 — the exact behaviour
+       every account had before this change, since two memberships did not
+       exist for anyone to reach it.
+    5. No memberships → 403 `tenant_membership_unresolved`, the one of the
+       three the caller genuinely cannot resolve alone.
 
-    `tenants_of_user` is read once and used for every case below it, rather
-    than once per case, so this is one round trip to the exemption regardless
-    of which case answers.
+    `tenants_of_user` is read once and used for every case below it, including
+    the 409's body, so this is one round trip to the exemption regardless of
+    which case answers.
     """
     memberships = await tenants_of_user(session_factory, user_id)
 
@@ -251,20 +290,28 @@ async def _resolve_tenant_id(
         )
         raise HTTPException(
             status_code=403,
-            detail=(
-                "This account is not a member of the selected tenant; "
-                "ask an administrator to check its membership."
-            ),
+            detail={
+                "error": TENANT_SELECTION_INVALID,
+                "message": (
+                    "The workspace selected on this session is not one you "
+                    "belong to. Choose another, or sign in again."
+                ),
+            },
         )
 
     if len(memberships) == 1:
         return memberships[0]
 
     if len(memberships) > 1 and choice_enabled:
-        choices = await list_tenant_memberships(session_factory, user_store, user_id)
+        choices = await _describe_memberships(
+            session_factory, user_store, user_id, memberships
+        )
         raise HTTPException(
             status_code=409,
-            detail=[choice.model_dump() for choice in choices],
+            detail={
+                "error": TENANT_SELECTION_REQUIRED,
+                "tenants": [choice.model_dump() for choice in choices],
+            },
         )
 
     logger.error(
@@ -274,10 +321,13 @@ async def _resolve_tenant_id(
     )
     raise HTTPException(
         status_code=403,
-        detail=(
-            "This account is not a member of exactly one tenant; "
-            "ask an administrator to check its membership."
-        ),
+        detail={
+            "error": TENANT_MEMBERSHIP_UNRESOLVED,
+            "message": (
+                "This account is not a member of exactly one workspace; "
+                "ask an administrator to check its membership."
+            ),
+        },
     )
 
 

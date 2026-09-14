@@ -30,7 +30,11 @@ from dataclasses import dataclass
 from fastapi import APIRouter
 
 import switch_core.gateway as gateway_package
-from switch_core.gateway.auth import get_current_user, require_admin
+from switch_core.gateway.auth import (
+    get_authenticated_user_id,
+    get_current_user,
+    require_admin,
+)
 from switch_core.gateway.dependencies import get_session, get_system_session
 
 # The only routes that may open a session with no tenant bound. `get_session`
@@ -43,6 +47,17 @@ from switch_core.gateway.dependencies import get_session, get_system_session
 _ROUTES_WITH_NO_TENANT_BOUND = {
     ("POST", "/auth/login"),
     ("GET", "/auth/oidc/callback"),
+    ("POST", "/tenants/{tenant_id}/switch"),
+}
+
+# The only routes that may authenticate a caller without resolving a tenant at
+# all. `get_authenticated_user_id` verifies the cookie and stops there, so it
+# is a reachable way past the membership check `get_current_user` performs —
+# every case of `_resolve_tenant_id`, including the two 403s. These two need
+# it because a caller with several memberships and no selection cannot reach
+# `get_current_user` by construction; nothing else has that excuse.
+_ROUTES_AUTHENTICATED_WITHOUT_RESOLVING_A_TENANT = {
+    ("GET", "/tenants"),
     ("POST", "/tenants/{tenant_id}/switch"),
 }
 
@@ -122,6 +137,29 @@ def test_the_routes_with_no_tenant_bound_are_exactly_these_three() -> None:
     assert {
         route.key for route in ROUTES if get_system_session in route.calls
     } == _ROUTES_WITH_NO_TENANT_BOUND
+
+
+def test_the_routes_skipping_tenant_resolution_are_exactly_these_two() -> None:
+    """`get_authenticated_user_id` is the newest way past the tenant check, and
+    the one with the least around it: no membership read, no scoped session,
+    nothing a policy would refuse. Pinned by the same reasoning
+    `test_tenant_exemption_allowlist` gives for the `SECURITY DEFINER`
+    lookups — what matters is that it is reachable, not that today's two
+    callers happen to be the right ones."""
+    assert {
+        route.key for route in ROUTES if get_authenticated_user_id in route.calls
+    } == _ROUTES_AUTHENTICATED_WITHOUT_RESOLVING_A_TENANT
+
+
+def test_no_route_both_resolves_a_tenant_and_skips_resolving_one() -> None:
+    """Taking both would mean the membership check runs and its answer is
+    ignored — the route would authorize against whichever dependency it
+    happened to read."""
+    assert not [
+        str(route)
+        for route in ROUTES
+        if get_authenticated_user_id in route.calls and get_current_user in route.calls
+    ]
 
 
 def test_the_exempt_routes_do_not_also_take_the_tenant_scoped_session() -> None:
