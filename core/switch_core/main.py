@@ -1079,6 +1079,33 @@ async def _migrate_and_grant(config: SwitchConfig) -> None:
     )
 
 
+def migrate() -> None:
+    """Entry point for migrating a deployment without starting a server.
+
+    Exists so a deploy can bring the schema up in a job of its own, ahead of
+    the pods that will serve on it, and still run *this* code rather than a
+    bare `alembic upgrade head`. The difference is everything `_migrate_and_grant`
+    adds around the upgrade: the boot lock, so the job and a replica that
+    starts while it is running cannot both be applying DDL, and the grant
+    re-issue, without which a table the migration just created is invisible to
+    the runtime role. A job that skipped either would leave the deployment in a
+    state the server then has to repair at boot, one replica at a time.
+
+    Boot runs the same function, and must keep doing so: nothing guarantees a
+    deployment has a migration job, and a developer running the server against
+    a fresh database has none. Running it twice is not wasted work — the second
+    pass finds no pending revisions and re-issues grants that are already
+    correct.
+    """
+    config = SwitchConfig()
+    running_version = switch_core_version()
+    configure_logging(config, running_version)
+
+    logger.info("Migrating switch-core %s", running_version or "(version unknown)")
+
+    asyncio.run(_migrate_and_grant(config))
+
+
 def main() -> None:
     config = SwitchConfig()
     running_version = switch_core_version()

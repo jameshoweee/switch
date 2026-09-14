@@ -229,6 +229,20 @@ class SwitchConfig(BaseSettings):
     # never killed mid-transaction.
     db_idle_in_transaction_session_timeout: str | None = None
 
+    # How long a migration waits for a lock before giving up (a Postgres
+    # interval such as "10s"; "0" waits forever). Migrations are DDL, so nearly
+    # every statement wants ACCESS EXCLUSIVE, and a request for one queues
+    # behind whatever transaction currently holds the table — and every reader
+    # arriving after it queues behind the request. A migration that waits out a
+    # long-running transaction therefore does not merely take longer; it stops
+    # the deployment still serving traffic beside it for as long as it waits.
+    # Failing instead turns that into an upgrade that did not happen, on a
+    # deployment that is still up on the old schema, which is the better of the
+    # two outcomes and the one worth retrying. Applies to the migration
+    # connection only: the application engine's statements take ordinary row
+    # and table locks that no amount of waiting escalates into this.
+    db_migration_lock_timeout: str = "10s"
+
     # A Postgres server that goes away without closing its sockets — a managed
     # instance failing over to its standby — leaves every connection open and
     # apparently healthy. Nothing above the socket can tell the difference:
@@ -322,6 +336,16 @@ class SwitchConfig(BaseSettings):
                 "DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT must be a Postgres "
                 "interval such as '15s', '500ms' or a bare count of "
                 f"milliseconds, got {value!r}."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_migration_lock_timeout(self) -> "SwitchConfig":
+        if not _PG_INTERVAL_RE.match(self.db_migration_lock_timeout):
+            raise ValueError(
+                "DB_MIGRATION_LOCK_TIMEOUT must be a Postgres interval such "
+                "as '10s', '500ms' or a bare count of milliseconds ('0' waits "
+                f"forever), got {self.db_migration_lock_timeout!r}."
             )
         return self
 
