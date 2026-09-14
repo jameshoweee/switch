@@ -80,9 +80,6 @@ class _FakeClientLifecycle:
 
 
 class _NoBridges:
-    def all_bridges(self) -> list[object]:
-        return []
-
     def bridges_for_tenant(self, tenant_id: str) -> list[object]:
         return []
 

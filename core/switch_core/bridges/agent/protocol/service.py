@@ -338,6 +338,9 @@ class ProtocolService:
         Raises:
             ValueError: name is invalid (lowercase alphanumeric, dots, hyphens,
                 or underscores — no spaces).
+            RuntimeError: no tenant is bound. Checked before anything is
+                written, because the agent's row and its bridge identities
+                both belong to a tenant and neither can be placed without one.
             InvalidIconUrl: ``icon_url`` is malformed or points somewhere unsafe.
             InvalidDisplayName: ``display_name`` is over-long or unsafe to render.
             AgentExistsError: agent with this name exists and ``overwrite`` is
@@ -349,6 +352,13 @@ class ProtocolService:
             raise ValueError(
                 f"Invalid agent name: {name!r}. "
                 "Use only lowercase letters, digits, dots, hyphens, and underscores."
+            )
+
+        tenant_id = current_tenant_id()
+        if tenant_id is None:
+            raise RuntimeError(
+                "register_agent requires a bound tenant; the agent's row and "
+                "its bridge identities both belong to one"
             )
 
         validated_icon_url = normalise_icon_url(icon_url)
@@ -430,7 +440,7 @@ class ProtocolService:
                 )
                 logger.info("Registered agent: %s (%s)", name, agent_id)
 
-        await self._create_bridge_identities(name, description)
+        await self._create_bridge_identities(tenant_id, name, description)
 
         return RegistrationResult(
             agent_id=agent_id,
@@ -695,24 +705,17 @@ class ProtocolService:
         return existing.id
 
     async def _create_bridge_identities(
-        self, agent_name: str, description: str
+        self, tenant_id: str, agent_name: str, description: str
     ) -> None:
-        """Create `agent_name`'s platform identity on every running bridge of
-        the registering tenant — and only that tenant's bridges.
+        """Create `agent_name`'s platform identity on the bridges of
+        `tenant_id` — and only that tenant's bridges.
 
-        A bound tenant is a precondition, not an input to fall back from: both
-        registration paths bind one before this runs (an authenticated
-        request via middleware, or ``register_agent_with_token`` itself), so
-        nothing bound here is a bug upstream, and fanning out to every
-        tenant's bridges instead would repeat the cross-tenant identity leak
-        this method exists to avoid.
+        The tenant is passed in rather than read from the ambient context so
+        that it is the caller's to establish: `register_agent` refuses without
+        one before it writes anything. Fanning out to every tenant's bridges
+        instead would repeat the cross-tenant identity leak this method exists
+        to avoid.
         """
-        tenant_id = current_tenant_id()
-        if tenant_id is None:
-            raise RuntimeError(
-                "_create_bridge_identities requires a bound tenant; "
-                "register_agent must be called with one already bound"
-            )
         for bridge_core in self.collab_lifecycle.bridges_for_tenant(tenant_id):
             try:
                 await bridge_core.adapter.create_agent_identity(agent_name, description)
@@ -815,24 +818,16 @@ class ProtocolService:
             await self.agent_store.update(session, agent_id, icon_url=validated)
             await session.commit()
 
-    async def _remove_bridge_identities(self, agent_name: str) -> None:
-        """Remove `agent_name`'s platform identity from every running bridge of
-        the deleting tenant — and only that tenant's bridges.
+    async def _remove_bridge_identities(self, tenant_id: str, agent_name: str) -> None:
+        """Remove `agent_name`'s platform identity from the bridges of
+        `tenant_id` — and only that tenant's bridges.
 
         Unscoped, this is worse than its `_create_bridge_identities` twin:
         deleting an agent in one tenant would delete the platform bot, user
-        group, or role of a same-named agent belonging to another tenant. A
-        bound tenant is a precondition here too — every `delete_agent` caller
-        (the HTTP/gateway endpoints, and the server-connector removal path)
-        runs under a tenant already bound by the request — so nothing bound is
-        a bug upstream, not a reason to fall back to every bridge.
+        group, or role of a same-named agent belonging to another tenant. As
+        there, the tenant is the caller's to establish — `delete_agent`
+        refuses without one before it stops anything.
         """
-        tenant_id = current_tenant_id()
-        if tenant_id is None:
-            raise RuntimeError(
-                "_remove_bridge_identities requires a bound tenant; "
-                "delete_agent must be called with one already bound"
-            )
         for bridge_core in self.collab_lifecycle.bridges_for_tenant(tenant_id):
             try:
                 await bridge_core.adapter.remove_agent_identity(agent_name)
@@ -852,10 +847,23 @@ class ProtocolService:
         """Delete an agent and clean up all associated state.
 
         Provide exactly one of ``agent_id`` or ``agent_name``.
+
+        Raises:
+            ValueError: neither or both selectors were given, or no such agent.
+            RuntimeError: no tenant is bound. Checked before the agent is
+                stopped, so an unbound caller leaves it running rather than
+                half torn down.
         """
         if (agent_id is None) == (agent_name is None):
             raise ValueError(
                 "delete_agent requires exactly one of agent_id or agent_name"
+            )
+
+        tenant_id = current_tenant_id()
+        if tenant_id is None:
+            raise RuntimeError(
+                "delete_agent requires a bound tenant; the agent's row and its "
+                "bridge identities both belong to one"
             )
 
         async with self.session_factory() as session:
@@ -874,7 +882,7 @@ class ProtocolService:
         await self.client_lifecycle.stop(client_id)
         self.event_buffer.remove(resolved_id)
 
-        await self._remove_bridge_identities(resolved_name)
+        await self._remove_bridge_identities(tenant_id, resolved_name)
 
         async with self.session_factory() as session:
             await self.agent_store.delete(session, resolved_id)

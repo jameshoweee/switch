@@ -2,9 +2,9 @@
 owns the agent (CHOO-2687).
 
 Before this fix, both `_create_bridge_identities` and `_remove_bridge_identities`
-looped over every running bridge on the instance
-(`CollaborationBridgeLifecycleService.all_bridges()`), which is a flat,
-cross-tenant dict:
+looped over every running bridge on the instance —
+`CollaborationBridgeLifecycleService` holds them in one flat, cross-tenant
+dict:
 
 - Registering an agent under tenant A called `create_agent_identity` on
   tenant B's bridges too — creating a Mattermost bot, Slack user group, or
@@ -19,15 +19,18 @@ No query is involved in either (it's an in-memory iteration followed by
 outbound platform API calls), so row-level security cannot catch it.
 
 These tests pin the fix: only the owning tenant's bridges are asked to
-create or remove the identity.
+create or remove the identity, and neither `register_agent` nor
+`delete_agent` will touch anything at all without a tenant bound.
 """
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from switch_core.bridges.agent.protocol.event_buffer import EventBuffer
 from switch_core.db.models import TENANT_ZERO_ID, Client, Tenant
+from switch_core.tenant_context import no_tenant
 from tests.switch_core.bridges.agent.protocol.registration_harness import (
     make_owner,
     make_service,
@@ -63,9 +66,6 @@ class _MultiTenantBridges:
     def __init__(self, bridges: list[_FakeBridge]) -> None:
         self._bridges = bridges
 
-    def all_bridges(self) -> list[_FakeBridge]:
-        return list(self._bridges)
-
     def bridges_for_tenant(self, tenant_id: str) -> list[_FakeBridge]:
         return [b for b in self._bridges if b.tenant_id == tenant_id]
 
@@ -100,6 +100,25 @@ class TestBridgeIdentityTenantScope:
         ]
         assert tenant_b_bridge.adapter.identities_created == []
 
+    async def test_unbound_registration_is_refused_before_the_agent_is_created(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        # The tenant is a precondition of registering, not of the bridge fan-out
+        # at the end of it: raising once the row is committed would leave a
+        # registered agent whose caller never received its API key.
+        svc = make_service(session_factory)
+        svc.collab_lifecycle = _MultiTenantBridges([])  # type: ignore[attr-defined]
+
+        owner = await make_owner(session_factory)
+
+        with no_tenant():
+            with pytest.raises(RuntimeError, match="requires a bound tenant"):
+                await register(svc, "unbound-bot", owner)
+
+        assert svc.client_lifecycle.requested_display_names == []  # type: ignore[attr-defined]
+        async with session_factory() as session:
+            assert await svc.agent_store.get_by_name(session, "unbound-bot") is None
+
 
 class _StoppableClientLifecycle:
     """`registration_harness.FakeClientLifecycle`, plus the `stop`/`remove`
@@ -107,6 +126,8 @@ class _StoppableClientLifecycle:
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+        self.stopped: list[str] = []
+        self.removed: list[str] = []
 
     async def create_client(self, *, client_type: str, display_name: str) -> Client:
         async with self._session_factory() as session:
@@ -123,10 +144,10 @@ class _StoppableClientLifecycle:
         pass
 
     async def stop(self, client_id: str) -> None:
-        return None
+        self.stopped.append(client_id)
 
     async def remove(self, client_id: str) -> None:
-        return None
+        self.removed.append(client_id)
 
 
 class TestBridgeIdentityRemovalTenantScope:
@@ -159,3 +180,27 @@ class TestBridgeIdentityRemovalTenantScope:
 
         assert tenant_a_bridge.adapter.identities_removed == ["shared-name"]
         assert tenant_b_bridge.adapter.identities_removed == []
+
+    async def test_unbound_deletion_is_refused_before_the_agent_is_stopped(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        # Same precondition from the other end. Raising part-way through leaves
+        # the worst state of all: the client stopped but never removed, the
+        # event buffer cleared, and the agent's row still in the database.
+        svc = make_service(session_factory)
+        svc.collab_lifecycle = _MultiTenantBridges([])  # type: ignore[attr-defined]
+        lifecycle = _StoppableClientLifecycle(session_factory)
+        svc.client_lifecycle = lifecycle  # type: ignore[attr-defined]
+        svc.event_buffer = EventBuffer()  # type: ignore[attr-defined]
+
+        owner = await make_owner(session_factory)
+        agent_id = await register(svc, "still-here", owner)
+
+        with no_tenant():
+            with pytest.raises(RuntimeError, match="requires a bound tenant"):
+                await svc.delete_agent(agent_id=agent_id)
+
+        assert lifecycle.stopped == []
+        assert lifecycle.removed == []
+        async with session_factory() as session:
+            assert await svc.agent_store.get(session, agent_id) is not None
