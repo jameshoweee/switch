@@ -44,8 +44,16 @@ on:
     branches: [main]
 
 # Cancel a PR's in-flight CI when a new commit is pushed to the same ref.
+#
+# Push runs get the commit in their group, so they never cancel each other.
+# Every merge to main shares one `github.ref`, so a single group would mean the
+# next merge kills the previous merge's run — and `migration-heads-on-merge`
+# only runs when the *triggering* commit touched migrations, so the run that
+# replaces it skips the job entirely. Merge a migration and anything else a
+# minute apart and no status is posted anywhere, silently, on exactly the busy
+# day this is meant to cover.
 concurrency:
-  group: pr-ci-${{ github.ref }}
+  group: pr-ci-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || '' }}
   cancel-in-progress: true
 
 permissions:
