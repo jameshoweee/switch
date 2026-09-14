@@ -70,6 +70,37 @@ This is a bigger change than the other three tickets put together, and it is
 the reason they cannot ship without it. It should be its own ticket, sequenced
 first. **This is the decision I want confirmed before anything is built.**
 
+### What a workspace admin actually gets, which is more than a list of routes
+
+The tempting way to describe this grant is to enumerate the admin-gated routes
+and classify each one. That description is incomplete, and incomplete in the
+direction that matters.
+
+`authz.can()` and `can_manage()` both short-circuit on `Principal.is_admin`
+*before* they look at ownership or visibility. The moment `tenant_members.role`
+feeds that bit, an `owner` or `admin` of a workspace holds read, write and
+delete on **every owned resource in it** — rooms, references, documents,
+packages — and management of every agent in it, whoever owns them. No route
+opts into this; it falls out of the one short-circuit. The widest path is
+`require_room_access`, which is not an explicitly admin-gated route at all.
+
+**The least obvious case, and the one to decide on purpose: a private room
+between a colleague and their agent.** A workspace admin can read it, write in
+it, and delete it. "Workspace administrators can read private rooms in their
+workspace" is a sentence someone should agree to rather than discover.
+
+This is invisible in tenant zero today. After the backfill migration the only
+`owner`/`admin` rows belong to deployment operators, who held all of it through
+the global bypass already. It becomes real the first time a person is invited
+into a workspace as an admin — that is, with §5.
+
+**Chosen: accept it for this phase, and write it down here rather than leave it
+implicit.** The alternative is a second, narrower bit — "administers the
+workspace's configuration" as distinct from "may act on its contents" — which
+is a real distinction and a real amount of work, and belongs to whichever phase
+takes on resource-level sharing. What must not happen is shipping the wide
+grant while the design describes the narrow one.
+
 ## 3. How a request picks its tenant
 
 A request must act in exactly one tenant — Phase 1 depends on that and nothing

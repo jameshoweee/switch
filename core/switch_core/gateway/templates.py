@@ -29,7 +29,7 @@ from switch_core.db.stores.template_store import (
     TemplateStore,
 )
 from switch_core.db.stores.user_store import UserStore
-from switch_core.gateway.auth import get_current_user
+from switch_core.gateway.auth import get_current_user, get_tenant_is_admin
 from switch_core.gateway.dependencies import (
     get_config,
     get_session,
@@ -155,7 +155,11 @@ def _require_within_size_limit(content: str, config: SwitchConfig) -> None:
 
 
 async def _load_for_management(
-    session: AsyncSession, store: TemplateStore, template_id: str, user: User
+    session: AsyncSession,
+    store: TemplateStore,
+    template_id: str,
+    user: User,
+    is_admin: bool,
 ) -> Template:
     """Fetch a template the caller is allowed to change, or fail saying why."""
     template = await store.get(session, template_id)
@@ -164,7 +168,10 @@ async def _load_for_management(
             status_code=404, detail=f"Template not found: {template_id}"
         )
     try:
-        require_manage(Principal(user.id, user.role == "admin"), template.owner_id)
+        require_manage(
+            Principal(user.id, is_admin),
+            template.owner_id,
+        )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     return template
@@ -303,8 +310,9 @@ async def patch_template(
     user_store: Annotated[UserStore, Depends(get_user_store)],
     config: Annotated[SwitchConfig, Depends(get_config)],
     user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
 ) -> TemplateDetail:
-    await _load_for_management(session, template_store, template_id, user)
+    await _load_for_management(session, template_store, template_id, user, is_admin)
     if req.content is not None:
         _require_within_size_limit(req.content, config)
         _require_storable(req.content)
@@ -333,8 +341,9 @@ async def delete_template(
     session: Annotated[AsyncSession, Depends(get_session)],
     template_store: Annotated[TemplateStore, Depends(get_template_store)],
     user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
 ) -> TemplateDeleteResponse:
-    await _load_for_management(session, template_store, template_id, user)
+    await _load_for_management(session, template_store, template_id, user, is_admin)
     try:
         await template_store.delete(session, template_id)
     except ValueError as e:
