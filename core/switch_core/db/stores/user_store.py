@@ -317,15 +317,22 @@ class UserStore:
         context — the operator bypass, or an owner/admin membership in it.
 
         See `authz.administers_tenant`, which this composes with a read of the
-        one membership row that can answer "in *this* tenant". No tenant bound
-        answers with the operator bit alone: every gateway request binds one
-        by the time this is reachable, and nothing here should insist on a
-        precondition that authentication already enforces.
+        one membership row that can answer "in *this* tenant".
+
+        Raises:
+            RuntimeError: no tenant is bound. The question has no
+                tenant-independent answer: half of it is a membership row that
+                cannot be read without one. Answering on the operator bit
+                alone would quietly demote a workspace owner to a plain
+                member, and the symptom — a 403 on their own workspace — says
+                nothing about why.
         """
         tenant_id = current_tenant_id()
-        role = (
-            None
-            if tenant_id is None
-            else await self.tenant_role(session, tenant_id, user.id)
-        )
+        if tenant_id is None:
+            raise RuntimeError(
+                "administers requires a bound tenant; whether someone may "
+                "administer a workspace is only answerable about a particular "
+                "one"
+            )
+        role = await self.tenant_role(session, tenant_id, user.id)
         return administers_tenant(is_operator=user.role == "admin", tenant_role=role)

@@ -31,6 +31,12 @@ from tests.switch_core.gateway.agent_route_harness import add_user
 _TEMPLATE_STORE = TemplateStore()
 _USER_STORE = UserStore()
 
+
+async def _is_admin(session: AsyncSession, user: object) -> bool:
+    """The bit `get_tenant_is_admin` hands the route, resolved the same way."""
+    return await _USER_STORE.administers(session, user)  # type: ignore[arg-type]
+
+
 # Awkward on purpose: CRLF, a tab, trailing spaces, unicode, no final newline.
 _AWKWARD_DOCUMENT = (
     "params:\r\n"
@@ -290,6 +296,7 @@ class TestOwnership:
                     session,
                     _TEMPLATE_STORE,
                     bob,
+                    await _is_admin(session, bob),
                 )
             assert exc.value.status_code == 403
             assert await _TEMPLATE_STORE.get(session, created.id) is not None  # type: ignore[attr-defined]
@@ -312,6 +319,7 @@ class TestOwnership:
                     _USER_STORE,
                     _config(),
                     bob,
+                    await _is_admin(session, bob),
                 )
             assert exc.value.status_code == 403
 
@@ -349,6 +357,7 @@ class TestOwnership:
                 session,
                 _TEMPLATE_STORE,
                 alice,
+                await _is_admin(session, alice),
             )
             assert result.deleted_id == created.id  # type: ignore[attr-defined]
             assert await _TEMPLATE_STORE.get(session, created.id) is None  # type: ignore[attr-defined]
@@ -367,6 +376,7 @@ class TestOwnership:
                 session,
                 _TEMPLATE_STORE,
                 admin,
+                await _is_admin(session, admin),
             )
             assert await _TEMPLATE_STORE.get(session, created.id) is None  # type: ignore[attr-defined]
 
@@ -387,6 +397,7 @@ class TestOwnership:
                 _USER_STORE,
                 _config(),
                 admin,
+                await _is_admin(session, admin),
             )
             assert updated.description == "tidied up by an admin"
             # Still Alice's — an admin edit is not a transfer of ownership.
@@ -400,7 +411,13 @@ class TestOwnership:
             await session.commit()
 
             with pytest.raises(HTTPException) as exc:
-                await delete_template("nope", session, _TEMPLATE_STORE, alice)
+                await delete_template(
+                    "nope",
+                    session,
+                    _TEMPLATE_STORE,
+                    alice,
+                    await _is_admin(session, alice),
+                )
             assert exc.value.status_code == 404
 
 
@@ -421,6 +438,7 @@ class TestUpdate:
                 _USER_STORE,
                 _config(),
                 alice,
+                await _is_admin(session, alice),
             )
             assert updated.version == 2
             assert updated.content == "room:\n  name: changed\n"
@@ -441,6 +459,7 @@ class TestUpdate:
                 _USER_STORE,
                 _config(),
                 alice,
+                await _is_admin(session, alice),
             )
             assert updated.version == 1
             assert updated.description == "clearer"
@@ -462,6 +481,7 @@ class TestUpdate:
                     _USER_STORE,
                     _config(template_max_bytes=100),
                     alice,
+                    await _is_admin(session, alice),
                 )
             assert exc.value.status_code == 413
             stored = await _TEMPLATE_STORE.get(session, created.id)  # type: ignore[attr-defined]
@@ -485,5 +505,6 @@ class TestUpdate:
                     _USER_STORE,
                     _config(),
                     alice,
+                    await _is_admin(session, alice),
                 )
             assert exc.value.status_code == 409

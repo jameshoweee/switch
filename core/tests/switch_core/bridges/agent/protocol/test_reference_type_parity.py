@@ -141,7 +141,8 @@ async def _seed(
 async def _slugs_from_route(
     session: AsyncSession, service: ResourceService, user: User
 ) -> set[str]:
-    listed = await route_list_types(session, service, _USER_STORE, user)
+    is_admin = await _USER_STORE.administers(session, user)
+    listed = await route_list_types(session, service, _USER_STORE, user, is_admin)
     return {info.type for info in listed}
 
 

@@ -21,7 +21,11 @@ from switch_core.db.stores.collaboration_bridge_store import CollaborationBridge
 from switch_core.db.stores.external_user_store import ExternalUserStore
 from switch_core.db.stores.room_store import RoomStore
 from switch_core.db.stores.user_store import UserStore
-from switch_core.gateway.auth import get_current_user, require_tenant_admin
+from switch_core.gateway.auth import (
+    get_current_user,
+    get_tenant_is_admin,
+    require_tenant_admin,
+)
 from switch_core.gateway.dependencies import (
     get_bridge_store,
     get_collab_lifecycle,
@@ -529,6 +533,7 @@ async def claim_bridge_identity(
         CollaborationBridgeLifecycleService, Depends(get_collab_lifecycle)
     ],
     user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
 ) -> ExternalUserSummary:
     """Claim a platform identity for a Switch user (CHOO-2137).
 
@@ -548,7 +553,7 @@ async def claim_bridge_identity(
         raise HTTPException(status_code=404, detail="Bridge not found")
 
     target_user_id = payload.user_id or user.id
-    if target_user_id != user.id and not await user_store.administers(session, user):
+    if target_user_id != user.id and not is_admin:
         raise HTTPException(
             status_code=403,
             detail="Only an admin may claim a messaging identity for another user",
@@ -635,6 +640,7 @@ async def release_bridge_identity(
     external_user_store: Annotated[ExternalUserStore, Depends(get_external_user_store)],
     user_store: Annotated[UserStore, Depends(get_user_store)],
     user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
     user_id: str | None = None,
 ) -> ExternalUserSummary:
     """Drop a claim on a platform account — your own, or someone else's if you
@@ -644,7 +650,7 @@ async def release_bridge_identity(
         raise HTTPException(status_code=404, detail="Identity not found")
 
     target_user_id = user_id or user.id
-    if target_user_id != user.id and not await user_store.administers(session, user):
+    if target_user_id != user.id and not is_admin:
         raise HTTPException(
             status_code=403,
             detail="Only an admin may release another user's messaging identity",

@@ -287,6 +287,7 @@ async def require_room_access(
     room_id: str,
     user: User,
     action: Action,
+    is_admin: bool,
 ) -> Room:
     """Load a room (404 if missing) and authorize `action` for `user`,
     raising HTTP 403 if denied.
@@ -295,11 +296,19 @@ async def require_room_access(
     id (attaching references, linking rooms, …) so they cannot operate on a
     room the caller lacks access to. Mirrors the protocol layer's
     ``_require_room_action``.
+
+    `is_admin` comes from ``get_tenant_is_admin``; it is a parameter rather
+    than a read of its own so that a route cannot end up authorizing against
+    a different admin bit than the one its own dependencies resolved.
+
+    This is the widest of the tenant-admin gates: `authz.can` short-circuits
+    on the admin bit, so a workspace owner or admin passes it for every room
+    in their workspace, private ones included. See the phase 2 design note on
+    what that grant covers.
     """
     room = await room_store.get(session, room_id)
     if room is None:
         raise HTTPException(status_code=404, detail="Room not found")
-    is_admin = await UserStore().administers(session, user)
     try:
         require(Principal(user.id, is_admin), action, room)
     except PermissionError as e:

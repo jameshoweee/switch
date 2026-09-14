@@ -6,7 +6,7 @@ workspace's `owner` membership row granted nothing: every admin-gated route
 checked the global bit, never the caller's role in the tenant the request is
 bound to.
 
-These tests pin the four behavioural claims that split makes true:
+These tests pin the behavioural claims that split makes true:
 
 - a workspace `owner` can administer resources in *their own* tenant;
 - the same person has no such power in a tenant they only hold a `member`
@@ -15,7 +15,9 @@ These tests pin the four behavioural claims that split makes true:
 - a deployment operator (`users.role == "admin"`) keeps its unconditional
   bypass regardless of what `tenant_members` says, in every tenant, with or
   without a membership row at all;
-- a plain `member` with no operator bit gains nothing.
+- a plain `member` with no operator bit gains nothing;
+- and with no tenant bound at all the question is refused rather than
+  answered on the operator bit alone, for operators too.
 
 Each is proven both at the pure-decision level (`authz.administers_tenant`,
 covered in `test_authz.py`) and here, against a real Postgres session and a
@@ -27,12 +29,13 @@ an actual resource decision is exercised end to end, not just the boolean.
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from switch_core.authz import Principal, can
 from switch_core.db.models import TENANT_ZERO_ID, Room, Tenant, TenantMember, User
 from switch_core.db.stores.user_store import UserStore
-from switch_core.tenant_context import tenant_scope
+from switch_core.tenant_context import no_tenant, tenant_scope
 
 TENANT_B = "tenant-b"
 
@@ -146,6 +149,40 @@ class TestUserStoreAdministers:
             await session.commit()
 
             assert await store.administers(session, stray) is False
+
+    async def test_unbound_is_refused_rather_than_answered_on_the_operator_bit(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        # Answering here would mean answering a question that was not asked:
+        # "may this person administer" has no deployment-wide form. The
+        # tempting fallback — the operator bit alone — silently strips a
+        # workspace owner of their role, and the 403 that follows names no
+        # cause. Same call as the one #442 made for the bridge identities.
+        store = UserStore()
+        async with session_factory() as session:
+            owner = await _make_user(session, "unbound-owner")
+            await _membership(session, TENANT_ZERO_ID, owner.id, "owner")
+            await session.commit()
+
+            with no_tenant():
+                with pytest.raises(RuntimeError, match="requires a bound tenant"):
+                    await store.administers(session, owner)
+
+    async def test_unbound_is_refused_for_an_operator_too(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        # The operator bypass is the one answer that *would* have been right
+        # without a tenant, which is exactly why it must not be given: a
+        # caller that reaches here unbound has a bug, and returning True for
+        # the most privileged accounts is the worst moment to hide one.
+        store = UserStore()
+        async with session_factory() as session:
+            operator = await _make_user(session, "unbound-operator", role="admin")
+            await session.commit()
+
+            with no_tenant():
+                with pytest.raises(RuntimeError, match="requires a bound tenant"):
+                    await store.administers(session, operator)
 
 
 class TestRoomAuthzThroughTenantRole:

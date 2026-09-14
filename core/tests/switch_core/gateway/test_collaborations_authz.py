@@ -138,6 +138,7 @@ class TestIdentityRoutesAreSelfOrAdmin:
                 user_store=_StubGet(None),  # type: ignore[arg-type]
                 collab_lifecycle=object(),  # type: ignore[arg-type]
                 user=_user(id="me", role="user"),
+                is_admin=False,
             )
         assert excinfo.value.status_code == 403
 
@@ -153,6 +154,7 @@ class TestIdentityRoutesAreSelfOrAdmin:
                 external_user_store=_StubGet(theirs),  # type: ignore[arg-type]
                 user_store=_StubGet(None),  # type: ignore[arg-type]
                 user=_user(id="me", role="user"),
+                is_admin=False,
                 user_id="someone-else",
             )
         assert excinfo.value.status_code == 403
