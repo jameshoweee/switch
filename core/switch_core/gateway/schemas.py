@@ -682,8 +682,18 @@ class InvitationCreateRequest(BaseModel):
     # None mints a shareable link; set, the invitation is addressed to one
     # email and accepting it with any other is refused.
     email: str | None = None
-    expires_in_hours: int = Field(default=168, gt=0)
+    # Bounded above as well as below: `timedelta` raises `OverflowError` past
+    # roughly 2.4e9 hours, so an unbounded value turns a bad request into a 500.
+    # A year is well beyond any legitimate invitation's life.
+    expires_in_hours: int = Field(default=168, gt=0, le=8760)
     uses_remaining: int = Field(default=1, ge=1)
+
+
+class InvitationAcceptRequest(BaseModel):
+    # In the body rather than the path: a URL travels through proxy logs,
+    # browser history and `Referer` headers, and this one is a bearer
+    # credential.
+    token: str
 
 
 class InvitationDetail(BaseModel):

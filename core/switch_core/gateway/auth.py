@@ -182,7 +182,7 @@ async def get_authenticated_caller(
 ) -> AuthenticatedCaller:
     """Like `get_authenticated_user_id`, but with the caller's own email too.
 
-    Backs `POST /invitations/{token}/accept` (`gateway/tenants.py`), which has
+    Backs `POST /invitations/accept` (`gateway/tenants.py`), which has
     to check an email-bound invitation against the caller's *current* address
     before any tenant is bound — the same "no tenant chosen yet" shape as
     `get_authenticated_user_id`, plus one more column of the same global,
@@ -459,6 +459,20 @@ async def get_tenant_is_admin(
     caller's `User`, and a `UserStore`.
     """
     return await user_store.administers(session, user)
+
+
+async def get_tenant_is_owner(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+) -> bool:
+    """Whether `user` may decide who owns the tenant this request is bound to.
+
+    Strictly narrower than ``get_tenant_is_admin`` — see
+    ``authz.owns_tenant``. A route that changes the ownership set needs both:
+    ``require_tenant_admin`` to get in, this to make the call.
+    """
+    return await user_store.owns(session, user)
 
 
 async def require_tenant_admin(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
@@ -16,13 +17,17 @@ from switch_core.db.models import Invitation, Tenant, TenantMember, User
 from switch_core.db.session_scope import tenant_session
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.api_key_store import ApiKeyStore
-from switch_core.db.stores.invitation_store import InvitationStore
+from switch_core.db.stores.invitation_store import (
+    InvitationNotUsableError,
+    InvitationStore,
+)
 from switch_core.db.stores.user_store import UserStore
 from switch_core.gateway.auth import (
     AuthenticatedCaller,
     get_authenticated_caller,
     get_authenticated_user_id,
     get_current_user,
+    get_tenant_is_owner,
     is_tenant_member,
     list_tenant_memberships,
     require_tenant_admin,
@@ -43,6 +48,7 @@ from switch_core.gateway.dependencies import (
     get_user_store,
 )
 from switch_core.gateway.schemas import (
+    InvitationAcceptRequest,
     InvitationCreateRequest,
     InvitationCreateResponse,
     InvitationDetail,
@@ -53,6 +59,8 @@ from switch_core.gateway.schemas import (
     TenantMembershipResponse,
 )
 from switch_core.tenant_context import current_tenant_id
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -119,6 +127,23 @@ def _member_detail(user: User, membership: TenantMember) -> MemberDetail:
     )
 
 
+def _require_owner(is_owner: bool, action: str) -> None:
+    """Raise 403 unless the caller owns the bound tenant.
+
+    The three actions this guards — granting `owner`, changing an owner's
+    role, removing an owner — are the ones that move a workspace's ownership
+    set, and none of them is reachable by a last-owner guard: an admin who
+    promotes themselves first leaves two owners standing at every subsequent
+    step, so each individual request looks safe while the sequence takes the
+    workspace. `require_tenant_admin` still gates getting this far; this is
+    the narrower bit on top (`authz.owns_tenant`).
+    """
+    if not is_owner:
+        raise HTTPException(
+            status_code=403, detail=f"Only a workspace owner may {action}"
+        )
+
+
 def _require_invitation_usable(invitation: Invitation, caller_email: str) -> None:
     """Raise 403 unless `invitation` may still be accepted by `caller_email`.
 
@@ -126,10 +151,17 @@ def _require_invitation_usable(invitation: Invitation, caller_email: str) -> Non
     expiry, remaining uses and an addressed email are four separate ways an
     invitation stops working, none of them optional
     (`docs/old/multi-tenancy-phase2-tenants.md`, §5).
+
+    This is for the message, not for the decision. Three of the four gates are
+    re-checked inside `InvitationStore.consume`'s own `UPDATE`, which is what
+    actually settles a race between two acceptances; read here, they can only
+    say why an invitation that is already unusable is unusable, in words the
+    invitee can act on. The fourth — the addressed email — is the one gate
+    only this function applies, because the store has no idea who is asking.
     """
     if invitation.revoked_at is not None:
         raise HTTPException(status_code=403, detail="This invitation has been revoked")
-    if invitation.expires_at < datetime.now(UTC):  # type: ignore[operator]
+    if invitation.expires_at < datetime.now(UTC):
         raise HTTPException(status_code=403, detail="This invitation has expired")
     if invitation.uses_remaining <= 0:
         raise HTTPException(
@@ -183,6 +215,16 @@ async def create_tenant(
     admin client every other tenant does. The membership row is not part of
     that call (it provisions the tenant, not any particular person's place in
     it), so it is written here, in its own session bound to the new tenant.
+
+    Two transactions, therefore, and the gap between them is real: the tenant
+    is committed before the membership is attempted, so a failure in the
+    second leaves a workspace nobody belongs to and a slug nobody can reuse.
+    It is not folded into one because the tenant row has to be committed
+    before `ensure_system_client` can provision against it, and that call is
+    inside the seam. What the gap gets instead is a log line naming the
+    workspace and the person who should have owned it, because the alternative
+    — a 500 with the orphan unrecorded — is the silent degradation this
+    codebase refuses. An operator repairs it by inserting the membership.
     """
     slug = _derive_slug(req.name)
     try:
@@ -192,11 +234,22 @@ async def create_tenant(
             status_code=409, detail=f"Slug already taken: {slug}"
         ) from exc
 
-    async with tenant_session(session_factory, tenant.id) as session:
-        await user_store.add_membership(
-            session, tenant_id=tenant.id, user_id=user_id, role="owner"
+    try:
+        async with tenant_session(session_factory, tenant.id) as session:
+            await user_store.add_membership(
+                session, tenant_id=tenant.id, user_id=user_id, role="owner"
+            )
+            await session.commit()
+    except Exception:
+        logger.error(
+            "Workspace %s (slug %s) was created but its owner membership for "
+            "user %s was not written: it now has no members and its slug is "
+            "taken. Insert the membership to repair it.",
+            tenant.id,
+            slug,
+            user_id,
         )
-        await session.commit()
+        raise
 
     return TenantMembershipResponse(
         id=tenant.id, slug=tenant.slug, name=tenant.name, role="owner"
@@ -248,11 +301,19 @@ async def create_invitation(
     session: Annotated[AsyncSession, Depends(get_session)],
     invitation_store: Annotated[InvitationStore, Depends(get_invitation_store)],
     user: Annotated[User, Depends(require_tenant_admin)],
+    is_owner: Annotated[bool, Depends(get_tenant_is_owner)],
 ) -> InvitationCreateResponse:
-    """Mint an invitation to the bound tenant. `owner`/`admin` only."""
+    """Mint an invitation to the bound tenant. `owner`/`admin` only.
+
+    An `owner` invitation is owner-only: minting one is granting ownership
+    with a step of indirection, so it answers to the same gate the direct
+    grant does (`_require_owner`).
+    """
     _require_bound_tenant(tenant_id)
     if req.role not in TENANT_MEMBER_ROLES:
         raise HTTPException(status_code=400, detail=f"Invalid role: {req.role}")
+    if req.role == "owner":
+        _require_owner(is_owner, "invite another owner")
 
     expires_at = datetime.now(UTC) + timedelta(hours=req.expires_in_hours)
     invitation, token = await invitation_store.create(
@@ -298,9 +359,9 @@ async def revoke_invitation(
     return _invitation_detail(invitation)
 
 
-@router.post("/invitations/{token}/accept")
+@router.post("/invitations/accept")
 async def accept_invitation(
-    token: str,
+    req: InvitationAcceptRequest,
     caller: Annotated[AuthenticatedCaller, Depends(get_authenticated_caller)],
     session_factory: Annotated[
         async_sessionmaker[AsyncSession], Depends(get_session_factory)
@@ -320,8 +381,19 @@ async def accept_invitation(
     own work inside a fresh `tenant_session` bound to exactly that tenant,
     rather than touching the request's session at all
     (`docs/old/multi-tenancy-phase2-tenants.md`, §5).
+
+    The token arrives in the body, not the path: it is a bearer credential,
+    and a path segment is written to proxy and access logs, kept in browser
+    history, and sent onward in `Referer`.
+
+    A use is spent only when a membership is actually granted. Accepting an
+    invitation you already hold is a no-op that returns your existing role —
+    a double-clicked shared link must not cost the invite a slot — and the
+    `consume` that does spend one is a conditional `UPDATE` that arbitrates
+    between simultaneous acceptances, so a single-use link grants exactly one
+    membership however many people race for it.
     """
-    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    token_hash = hashlib.sha256(req.token.encode()).hexdigest()
     tenant_id = await tenant_of_invitation_token(session_factory, token_hash)
     if tenant_id is None:
         raise HTTPException(status_code=404, detail="Invitation not found")
@@ -333,12 +405,19 @@ async def accept_invitation(
         _require_invitation_usable(invitation, caller.email)
 
         existing_role = await user_store.tenant_role(session, tenant_id, caller.id)
-        role = existing_role if existing_role is not None else invitation.role
         if existing_role is None:
+            try:
+                await invitation_store.consume(session, invitation.id)
+            except InvitationNotUsableError as exc:
+                raise HTTPException(
+                    status_code=403, detail="This invitation has already been used"
+                ) from exc
+            role = invitation.role
             await user_store.add_membership(
                 session, tenant_id=tenant_id, user_id=caller.id, role=role
             )
-        await invitation_store.consume(session, invitation)
+        else:
+            role = existing_role
 
         tenant = await session.get(Tenant, tenant_id)
         assert tenant is not None
@@ -374,11 +453,18 @@ async def update_member_role(
     session: Annotated[AsyncSession, Depends(get_session)],
     user_store: Annotated[UserStore, Depends(get_user_store)],
     _admin: Annotated[User, Depends(require_tenant_admin)],
+    is_owner: Annotated[bool, Depends(get_tenant_is_owner)],
 ) -> MemberDetail:
     """Change a member's role. `owner`/`admin` only.
 
-    Refuses to demote the last `owner`: with no workspace deletion in this
-    phase, there is no legitimate route to a workspace with none.
+    Both ends of the ownership set are owner-only: an admin may promote a
+    member to admin, but not to `owner`, and may not touch an existing
+    owner's role at all. See `_require_owner` for what an admin who could do
+    either would be able to do in three requests.
+
+    Refuses to demote the last `owner` on top of that: with no workspace
+    deletion in this phase, there is no legitimate route to a workspace with
+    none.
     """
     _require_bound_tenant(tenant_id)
     if req.role not in TENANT_MEMBER_ROLES:
@@ -388,7 +474,11 @@ async def update_member_role(
     if membership is None:
         raise HTTPException(status_code=404, detail="Not a member of this tenant")
 
+    if req.role == "owner" and membership.role != "owner":
+        _require_owner(is_owner, "grant ownership")
+
     if membership.role == "owner" and req.role != "owner":
+        _require_owner(is_owner, "change an owner's role")
         if await user_store.count_owners(session) <= 1:
             raise HTTPException(status_code=409, detail="Cannot demote the last owner")
 
@@ -410,10 +500,12 @@ async def remove_member(
     api_key_store: Annotated[ApiKeyStore, Depends(get_api_key_store)],
     protocol: Annotated[ProtocolService, Depends(get_protocol)],
     _admin: Annotated[User, Depends(require_tenant_admin)],
+    is_owner: Annotated[bool, Depends(get_tenant_is_owner)],
 ) -> dict[str, bool]:
     """Remove a member from the bound tenant. `owner`/`admin` only.
 
-    Refuses to remove the last `owner`, same as demoting one.
+    Removing an *owner* is owner-only, the same as demoting one and for the
+    same reason (`_require_owner`), and refuses on the last owner besides.
 
     Removal also revokes what the member's own credentials in this tenant let
     them do here, in the same transaction as the membership row going away —
@@ -431,16 +523,21 @@ async def remove_member(
     another — but deleting an agent is not, and a member removal is routine
     enough, including by mistake, that it must not be the thing that makes an
     irreversible call about shared infrastructure. An admin who hits this
-    reassigns or deletes those agents deliberately, with the agent in front of
-    them, then removes the member.
+    deletes those agents deliberately, with the agent in front of them, then
+    removes the member. The 409 says exactly that and nothing more: there is
+    no route that reassigns an agent's owner in this phase, so offering
+    reassignment as the way out would send an admin looking for a button that
+    does not exist.
     """
     _require_bound_tenant(tenant_id)
     membership = await session.get(TenantMember, (tenant_id, user_id))
     if membership is None:
         raise HTTPException(status_code=404, detail="Not a member of this tenant")
 
-    if membership.role == "owner" and await user_store.count_owners(session) <= 1:
-        raise HTTPException(status_code=409, detail="Cannot remove the last owner")
+    if membership.role == "owner":
+        _require_owner(is_owner, "remove an owner")
+        if await user_store.count_owners(session) <= 1:
+            raise HTTPException(status_code=409, detail="Cannot remove the last owner")
 
     owned_agents = await agent_store.get_by_owner(session, user_id)
     if owned_agents:
@@ -449,7 +546,7 @@ async def remove_member(
             status_code=409,
             detail=(
                 "Cannot remove: this member owns agents in this tenant — "
-                f"reassign or delete them first: {names}"
+                f"delete them first: {names}"
             ),
         )
 

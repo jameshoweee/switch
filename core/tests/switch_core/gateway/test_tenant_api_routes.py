@@ -328,6 +328,131 @@ class TestInvitationAuthorisation:
         assert body["uses_remaining"] == 3
         assert "token" in body and body["token"]
 
+    async def test_an_absurd_expiry_is_refused_rather_than_crashing(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """`timedelta` raises `OverflowError` well before `int` runs out, so an
+        expiry bounded only from below turns a bad request into a 500. The
+        bound belongs on the schema, where it is a 422 with a field name."""
+        await _make_tenant(session_factory, TENANT_A)
+        user_id = await _make_member(
+            session_factory, name="time-lord", tenant_id=TENANT_A, role="owner"
+        )
+        token = _token(user_id, "time-lord@example.invalid", TENANT_A)
+
+        async with _client(_app(session_factory), token) as client:
+            response = await client.post(
+                f"/tenants/{TENANT_A}/invitations",
+                json={"role": "member", "expires_in_hours": 1000000000},
+            )
+
+        assert response.status_code == 422, response.text
+
+
+class TestOwnershipIsOwnerOnly:
+    """Who owns a workspace is decided by its owners, not by its admins.
+
+    An `admin` runs the workspace; only an `owner` moves the ownership set.
+    The distinction exists because a last-owner guard cannot see a sequence:
+    each request below is individually safe — two owners stand at every
+    step — and together they hand the workspace to someone the founder never
+    promoted.
+    """
+
+    async def test_an_admin_cannot_take_the_workspace_from_its_owner(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _make_tenant(session_factory, TENANT_A)
+        founder_id = await _make_member(
+            session_factory, name="founder-owner", tenant_id=TENANT_A, role="owner"
+        )
+        admin_id = await _make_member(
+            session_factory, name="ambitious-admin", tenant_id=TENANT_A, role="admin"
+        )
+        token = _token(admin_id, "ambitious-admin@example.invalid", TENANT_A)
+
+        async with _client(_app(session_factory), token) as client:
+            promote_self = await client.patch(
+                f"/tenants/{TENANT_A}/members/{admin_id}", json={"role": "owner"}
+            )
+            demote_founder = await client.patch(
+                f"/tenants/{TENANT_A}/members/{founder_id}", json={"role": "member"}
+            )
+            remove_founder = await client.delete(
+                f"/tenants/{TENANT_A}/members/{founder_id}"
+            )
+
+        assert promote_self.status_code == 403, promote_self.text
+        assert demote_founder.status_code == 403, demote_founder.text
+        assert remove_founder.status_code == 403, remove_founder.text
+
+        async with session_factory() as session:
+            founder = await session.get(TenantMember, (TENANT_A, founder_id))
+            admin = await session.get(TenantMember, (TENANT_A, admin_id))
+            assert founder is not None and founder.role == "owner"
+            assert admin is not None and admin.role == "admin"
+
+    async def test_an_admin_cannot_mint_an_owner_invitation(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Otherwise the escalation above is the same three steps with a link
+        in the middle: invite an accomplice as owner, then let them do it."""
+        await _make_tenant(session_factory, TENANT_A)
+        await _make_member(
+            session_factory, name="quiet-owner", tenant_id=TENANT_A, role="owner"
+        )
+        admin_id = await _make_member(
+            session_factory, name="inviting-admin", tenant_id=TENANT_A, role="admin"
+        )
+        token = _token(admin_id, "inviting-admin@example.invalid", TENANT_A)
+
+        async with _client(_app(session_factory), token) as client:
+            refused = await client.post(
+                f"/tenants/{TENANT_A}/invitations", json={"role": "owner"}
+            )
+            allowed = await client.post(
+                f"/tenants/{TENANT_A}/invitations", json={"role": "admin"}
+            )
+
+        assert refused.status_code == 403, refused.text
+        assert allowed.status_code == 201, allowed.text
+
+        async with tenant_session(session_factory, TENANT_A) as scoped:
+            roles = [i.role for i in await InvitationStore().list_for_tenant(scoped)]
+        assert roles == ["admin"]
+
+    async def test_an_owner_can_do_all_of_it(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """The guard is narrower authority, not a locked door: everything the
+        admin was refused above succeeds for an owner."""
+        await _make_tenant(session_factory, TENANT_A)
+        owner_id = await _make_member(
+            session_factory, name="real-owner", tenant_id=TENANT_A, role="owner"
+        )
+        member_id = await _make_member(
+            session_factory, name="promoted", tenant_id=TENANT_A, role="member"
+        )
+        token = _token(owner_id, "real-owner@example.invalid", TENANT_A)
+
+        async with _client(_app(session_factory), token) as client:
+            promote = await client.patch(
+                f"/tenants/{TENANT_A}/members/{member_id}", json={"role": "owner"}
+            )
+            demote = await client.patch(
+                f"/tenants/{TENANT_A}/members/{member_id}", json={"role": "member"}
+            )
+            invite = await client.post(
+                f"/tenants/{TENANT_A}/invitations", json={"role": "owner"}
+            )
+            remove = await client.delete(f"/tenants/{TENANT_A}/members/{member_id}")
+
+        assert promote.status_code == 200, promote.text
+        assert promote.json()["role"] == "owner"
+        assert demote.status_code == 200, demote.text
+        assert invite.status_code == 201, invite.text
+        assert remove.status_code == 200, remove.text
+
 
 class TestInvitationLifecycle:
     async def _mint(
@@ -373,7 +498,7 @@ class TestInvitationLifecycle:
         caller_token = _token(invitee_id, "invitee@example.invalid", TENANT_B)
 
         async with _client(_app(session_factory), caller_token) as client:
-            response = await client.post(f"/invitations/{token}/accept")
+            response = await client.post("/invitations/accept", json={"token": token})
 
         assert response.status_code == 200, response.text
         body = response.json()
@@ -384,6 +509,43 @@ class TestInvitationLifecycle:
             membership = await session.get(TenantMember, (TENANT_A, invitee_id))
             assert membership is not None
             assert membership.role == "admin"
+
+    async def test_re_accepting_an_invitation_you_already_hold_costs_nothing(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """A shared link is double-clicked, or reloaded, or opened on a phone
+        as well. The second acceptance grants nothing new, so it must spend
+        nothing either — otherwise one careless refresh burns a seat that was
+        meant for somebody else, and the invitation dies with nobody's
+        membership to show for it.
+        """
+        await _make_tenant(session_factory, TENANT_A)
+        admin_id = await _make_member(
+            session_factory, name="link-sharer", tenant_id=TENANT_A, role="owner"
+        )
+        invitation_id, token = await self._mint(
+            session_factory, tenant_id=TENANT_A, admin_id=admin_id, uses_remaining=2
+        )
+        await _make_tenant(session_factory, TENANT_B)
+        invitee_id = await _make_member(
+            session_factory, name="double-clicker", tenant_id=TENANT_B, role="member"
+        )
+
+        app = _app(session_factory)
+        async with _client(
+            app, _token(invitee_id, "double-clicker@example.invalid", TENANT_B)
+        ) as client:
+            first = await client.post("/invitations/accept", json={"token": token})
+            second = await client.post("/invitations/accept", json={"token": token})
+
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert second.json()["role"] == first.json()["role"]
+
+        async with tenant_session(session_factory, TENANT_A) as session:
+            invitation = await session.get(Invitation, invitation_id)
+            assert invitation is not None
+            assert invitation.uses_remaining == 1
 
     async def test_accepting_twice_fails_the_second_time(
         self, session_factory: async_sessionmaker[AsyncSession]
@@ -407,13 +569,13 @@ class TestInvitationLifecycle:
         async with _client(
             app, _token(first_invitee, "first-invitee@example.invalid", TENANT_B)
         ) as client:
-            first = await client.post(f"/invitations/{token}/accept")
+            first = await client.post("/invitations/accept", json={"token": token})
         assert first.status_code == 200, first.text
 
         async with _client(
             app, _token(second_invitee, "second-invitee@example.invalid", TENANT_B)
         ) as client:
-            second = await client.post(f"/invitations/{token}/accept")
+            second = await client.post("/invitations/accept", json={"token": token})
 
         assert second.status_code == 403
         assert "used" in second.json()["detail"].lower()
@@ -444,7 +606,7 @@ class TestInvitationLifecycle:
             _app(session_factory),
             _token(invitee_id, "too-late@example.invalid", TENANT_B),
         ) as client:
-            response = await client.post(f"/invitations/{token}/accept")
+            response = await client.post("/invitations/accept", json={"token": token})
 
         assert response.status_code == 403
         assert "revoked" in response.json()["detail"].lower()
@@ -480,7 +642,7 @@ class TestInvitationLifecycle:
             _app(session_factory),
             _token(invitee_id, "too-slow@example.invalid", TENANT_B),
         ) as client:
-            response = await client.post(f"/invitations/{token}/accept")
+            response = await client.post("/invitations/accept", json={"token": token})
 
         assert response.status_code == 403
         assert "expired" in response.json()["detail"].lower()
@@ -511,7 +673,7 @@ class TestInvitationLifecycle:
             _app(session_factory),
             _token(wrong_person, "someone-else@example.invalid", TENANT_B),
         ) as client:
-            response = await client.post(f"/invitations/{token}/accept")
+            response = await client.post("/invitations/accept", json={"token": token})
 
         assert response.status_code == 403
         assert "email" in response.json()["detail"].lower()
@@ -542,7 +704,7 @@ class TestInvitationLifecycle:
             _app(session_factory),
             _token(right_person, "right-person@example.invalid", TENANT_B),
         ) as client:
-            response = await client.post(f"/invitations/{token}/accept")
+            response = await client.post("/invitations/accept", json={"token": token})
 
         assert response.status_code == 200, response.text
 

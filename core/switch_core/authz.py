@@ -68,6 +68,19 @@ def administers_tenant(*, is_operator: bool, tenant_role: str | None) -> bool:
     return is_operator or tenant_role in TENANT_ADMIN_ROLES
 
 
+def owns_tenant(*, is_operator: bool, tenant_role: str | None) -> bool:
+    """Whether a caller may dispose of the tenant they hold `tenant_role` in.
+
+    Narrower than `administers_tenant` on purpose. An `admin` runs a workspace;
+    an `owner` decides who else gets to. The two collapse into one bit for
+    everything inside a workspace — rooms, agents, references — but not for the
+    ownership set itself: if an admin may grant `owner`, demote an owner, or
+    remove one, then an admin may take the workspace, and each of those steps
+    passes a last-owner guard on its own. Gate those three on this.
+    """
+    return is_operator or tenant_role == "owner"
+
+
 @runtime_checkable
 class Authorizable(Protocol):
     """Structural interface for any entity `can` arbitrates over.

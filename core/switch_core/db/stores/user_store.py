@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from switch_core.authz import administers_tenant
+from switch_core.authz import administers_tenant, owns_tenant
 from switch_core.db.models import (
     OidcIdentity,
     TenantMember,
@@ -384,3 +384,23 @@ class UserStore:
             )
         role = await self.tenant_role(session, tenant_id, user.id)
         return administers_tenant(is_operator=user.role == "admin", tenant_role=role)
+
+    async def owns(self, session: AsyncSession, user: User) -> bool:
+        """Whether `user` may decide who owns the tenant bound to `session`'s
+        context — the operator bypass, or an `owner` membership in it.
+
+        The same composition as `administers`, over `authz.owns_tenant`; see
+        there for why the two are separate bits rather than one.
+
+        Raises:
+            RuntimeError: no tenant is bound, for the same reason
+                `administers` raises.
+        """
+        tenant_id = current_tenant_id()
+        if tenant_id is None:
+            raise RuntimeError(
+                "owns requires a bound tenant; whether someone owns a "
+                "workspace is only answerable about a particular one"
+            )
+        role = await self.tenant_role(session, tenant_id, user.id)
+        return owns_tenant(is_operator=user.role == "admin", tenant_role=role)

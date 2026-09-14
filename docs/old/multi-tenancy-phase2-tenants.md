@@ -188,7 +188,9 @@ this phase must prove it has removed.
 - `POST /tenants/{id}/switch` — verify membership, re-mint the cookie.
 - `POST /tenants/{id}/invitations`, `GET`, `DELETE …/{token_id}` — mint, list,
   revoke. `owner` and `admin` only.
-- `POST /invitations/{token}/accept` — accept.
+- `POST /invitations/accept` — accept. The token goes in the body, not the
+  path: a URL segment ends up in proxy logs, browser history and `Referer`,
+  and this one is a bearer credential.
 - `GET /tenants/{id}/members`, `PATCH …/{user_id}`, `DELETE …/{user_id}` —
   list, change a role, remove. The original design omitted these and then
   assumed the role-change route existed.
@@ -196,6 +198,14 @@ this phase must prove it has removed.
 **A workspace must always have an owner.** Removing or demoting the last one
 is refused; deletion of a workspace is not in this phase, so there is no
 legitimate path to an ownerless one.
+
+**Who owns a workspace is decided by its owners, not by its admins.** Granting
+`owner`, changing an owner's role, removing an owner, and minting an `owner`
+invitation are all owner-only, over and above the `owner`/`admin` gate on the
+route. The last-owner rule above cannot substitute for this, because it cannot
+see a sequence: an admin who promotes themselves first leaves two owners
+standing at every subsequent step, so each individual request passes while the
+three together take the workspace.
 
 **Invitations are a table, and a link that grants membership is a credential.**
 `id`, `tenant_id`, `role`, `email` (null for a link), `expires_at`,
