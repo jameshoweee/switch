@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 
 from sqlalchemy import (
     DDL,
@@ -287,12 +288,23 @@ class Invitation(TenantScoped, Base):
     None of the three are optional here — a table that could not expire or be
     revoked would not be a credential, and the design this implements is
     explicit that expiry and revocation are not optional.
+
+    The floor under `uses_remaining` is a constraint rather than a convention
+    because the thing it guards against is a lost race, not a typo: two
+    concurrent acceptances of a single-use invitation can both read `1` and
+    both write `0`, and read-committed will let both commit. `consume`
+    (`db/stores/invitation_store.py`) is the decrement that cannot lose that
+    race; the constraint is what makes any other decrement fail loudly instead
+    of over-granting membership.
     """
 
     __tablename__ = "invitations"
     __table_args__ = (
         CheckConstraint(
             "role IN ('owner', 'admin', 'member')", name="ck_invitations_role"
+        ),
+        CheckConstraint(
+            "uses_remaining >= 0", name="ck_invitations_uses_remaining_not_negative"
         ),
     )
 
@@ -303,15 +315,17 @@ class Invitation(TenantScoped, Base):
     # resolves the hash before a tenant is known, so it cannot be scoped by
     # one.
     token_hash: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
-    expires_at: Mapped[str] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     uses_remaining: Mapped[int] = mapped_column(Integer, nullable=False)
-    revoked_at: Mapped[str | None] = mapped_column(
+    revoked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     created_by: Mapped[str] = mapped_column(
         Text, ForeignKey("users.id"), nullable=False
     )
-    created_at: Mapped[str] = mapped_column(
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 

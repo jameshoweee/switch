@@ -13,6 +13,13 @@ before a tenant is known, so a per-tenant index could not answer the question
 being asked. Only the hash is ever stored — the token itself never reaches
 this table, or any other.
 
+`uses_remaining >= 0` is a constraint and not a convention because the failure
+it prevents is a lost race rather than a typo: two concurrent acceptances of a
+single-use invitation can both read `1` and both write `0` under read-
+committed, and both commit. The store's `consume` does the decrement as one
+conditional `UPDATE` so that cannot happen; this constraint is what makes any
+future decrement that forgets fail loudly rather than grant membership twice.
+
 `tenant_of_invitation(token_hash)` is the lookup that resolves it, and it is
 an addition to the closed set of `SECURITY DEFINER` functions `9c41a7b0e5d8`
 installed as the whole exemption from row-level security. That set is
@@ -91,6 +98,9 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "role IN ('owner', 'admin', 'member')", name="ck_invitations_role"
+        ),
+        sa.CheckConstraint(
+            "uses_remaining >= 0", name="ck_invitations_uses_remaining_not_negative"
         ),
         sa.PrimaryKeyConstraint("id"),
         sa.ForeignKeyConstraint(

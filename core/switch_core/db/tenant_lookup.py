@@ -102,9 +102,11 @@ request carries a token and nothing else, no tenant is bound yet, and the
 table it would have to read (`invitations`) is tenant-scoped like everything
 else, so the policy refuses exactly the read that has to happen first. Resolve
 the tenant here, bind it, then read the invitation itself — its role, its
-email, whether it is spent or revoked — through the ordinary scoped store.
-Nothing about *that* row crosses the exemption; only the tenant id does, which
-is the property every lookup in this module rests on.
+email, whether it is spent, expired or revoked — through the ordinary scoped
+store, whose `get_valid_by_token_hash` and `consume` are where those three
+gates are actually enforced. Nothing about *that* row crosses the exemption;
+only the tenant id does, which is the property every lookup in this module
+rests on.
 
 Why not the obvious alternatives is argued in
 `docs/old/multi-tenancy-phase1-db.md`, "The bootstrap problem"; the short
