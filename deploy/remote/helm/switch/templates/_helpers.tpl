@@ -517,6 +517,8 @@ Include with `nindent 12`.
 - name: DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT
   value: {{ . | quote }}
 {{- end }}
+- name: DB_MIGRATION_LOCK_TIMEOUT
+  value: {{ .Values.postgresql.migrationLockTimeout | quote }}
 - name: AGENT_AUTH_CACHE_TTL_SECONDS
   value: {{ .Values.switchCore.authCache.ttlSeconds | quote }}
 - name: MATRIX_SERVER_NAME
