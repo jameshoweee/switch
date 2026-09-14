@@ -139,10 +139,9 @@ class TenantLookupError(RuntimeError):
 
     Only reachable for a key that is not unique by constraint — today only
     `agents.oauth_client_id`, which has no unique index. Raised rather than
-    resolved by picking one, for the same reason `get_sole_tenant_id` refuses
-    to: a credential that resolves to two tenants is a provisioning fault, and
-    guessing which one it meant is how a caller ends up authenticated into
-    somebody else's data.
+    resolved by picking one: a credential that resolves to two tenants is a
+    provisioning fault, and guessing which one it meant is how a caller ends
+    up authenticated into somebody else's data.
     """
 
 
