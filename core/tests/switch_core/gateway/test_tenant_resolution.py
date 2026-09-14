@@ -45,10 +45,9 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import Depends, FastAPI, Response
-from sqlalchemy import insert, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from switch_core.db.base import Base
 from switch_core.db.engine import create_session_factory
 from switch_core.db.models import TENANT_ZERO_ID, Tenant, TenantMember, User
 from switch_core.db.stores.user_store import UserStore
@@ -66,6 +65,7 @@ from switch_core.gateway.auth import (
 from switch_core.gateway.auth_routes import login
 from switch_core.gateway.schemas import LoginRequest
 from switch_core.gateway.tenants import router as tenants_router
+from tests.conftest import empty_the_database
 
 _SECRET = "unit-test-jwt-key-unit-test-jwt-key-unit-test"  # gitleaks:allow
 TENANT_B = "tenant-resolution-b"
@@ -540,7 +540,7 @@ class TestSwitchTenantEndpoint:
 
 @pytest_asyncio.fixture
 async def one_connection_session_factory(
-    postgres_url: str,
+    postgres_schema: str,
 ) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     """A pool of exactly one connection, and a short timeout for waiting on it.
 
@@ -550,20 +550,12 @@ async def one_connection_session_factory(
     production.
     """
     engine = create_async_engine(
-        postgres_url, pool_size=1, max_overflow=0, pool_timeout=5
+        postgres_schema, pool_size=1, max_overflow=0, pool_timeout=5
     )
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.execute(
-            insert(Tenant.__table__).values(
-                id=TENANT_ZERO_ID, slug="default", name="Default"
-            )
-        )
+    await empty_the_database(engine)
     try:
         yield create_session_factory(engine)
     finally:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all)
         await engine.dispose()
 
 
