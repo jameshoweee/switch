@@ -31,6 +31,7 @@ from fastapi import APIRouter
 
 import switch_core.gateway as gateway_package
 from switch_core.gateway.auth import (
+    get_authenticated_caller,
     get_authenticated_user_id,
     get_current_user,
     require_admin,
@@ -50,15 +51,39 @@ _ROUTES_WITH_NO_TENANT_BOUND = {
     ("POST", "/tenants/{tenant_id}/switch"),
 }
 
-# The only routes that may authenticate a caller without resolving a tenant at
-# all. `get_authenticated_user_id` verifies the cookie and stops there, so it
-# is a reachable way past the membership check `get_current_user` performs —
-# every case of `_resolve_tenant_id`, including the two 403s. These two need
-# it because a caller with several memberships and no selection cannot reach
-# `get_current_user` by construction; nothing else has that excuse.
-_ROUTES_AUTHENTICATED_WITHOUT_RESOLVING_A_TENANT = {
+# Every route that does not resolve a tenant, for any reason. `get_current_user`
+# is the only dependency that performs the membership check in
+# `_resolve_tenant_id`, so a route without it authorizes against no workspace —
+# whether it skipped the check deliberately (`get_authenticated_user_id`,
+# `get_authenticated_caller`) or simply has no caller yet (login, the OIDC
+# handshake).
+#
+# The predicate is the absence of `get_current_user` rather than the presence of
+# any particular alternative, because the alternatives keep arriving: keying on
+# `get_system_session` missed the routes that take `get_session_factory` and open
+# their own, and keying on `get_authenticated_user_id` missed
+# `get_authenticated_caller`. This way the next door is a failing test rather
+# than a route nobody counted. `_ROUTES_WITH_NO_TENANT_BOUND` is a strict subset.
+_ROUTES_THAT_NEVER_BIND_A_TENANT = {
+    # No caller yet: the sign-in surface and what it hands back.
+    ("GET", "/auth/config"),
+    ("GET", "/auth/oidc/login"),
+    ("GET", "/auth/oidc/callback"),
+    ("POST", "/auth/login"),
+    ("POST", "/auth/logout"),
+    # A deployment-wide constant — the agent types this build knows about.
+    # Nothing tenant-specific to scope it to.
+    ("GET", "/known-types"),
+    # A caller with several memberships and no selection cannot reach
+    # `get_current_user` by construction, and these are the routes such a
+    # caller needs: list the workspaces, make one, pick one.
     ("GET", "/tenants"),
+    ("POST", "/tenants"),
     ("POST", "/tenants/{tenant_id}/switch"),
+    # Accepting an invitation binds the tenant the *token* names, which is
+    # neither the one on the caller's session nor one they belong to yet. It
+    # opens its own `tenant_session` around that id — see `accept_invitation`.
+    ("POST", "/invitations/accept"),
 }
 
 
@@ -139,16 +164,38 @@ def test_the_routes_with_no_tenant_bound_are_exactly_these_three() -> None:
     } == _ROUTES_WITH_NO_TENANT_BOUND
 
 
-def test_the_routes_skipping_tenant_resolution_are_exactly_these_two() -> None:
-    """`get_authenticated_user_id` is the newest way past the tenant check, and
-    the one with the least around it: no membership read, no scoped session,
-    nothing a policy would refuse. Pinned by the same reasoning
-    `test_tenant_exemption_allowlist` gives for the `SECURITY DEFINER`
-    lookups — what matters is that it is reachable, not that today's two
-    callers happen to be the right ones."""
+def test_the_routes_that_never_bind_a_tenant_are_exactly_these() -> None:
+    """Pinned by the same reasoning `test_tenant_exemption_allowlist` gives for
+    the `SECURITY DEFINER` lookups — what matters is that skipping the tenant
+    check is *reachable*, not that today's callers happen to be the right ones.
+    A route that lands here has no workspace to authorize against and has to
+    say, in its own docstring, what it does instead."""
     assert {
-        route.key for route in ROUTES if get_authenticated_user_id in route.calls
-    } == _ROUTES_AUTHENTICATED_WITHOUT_RESOLVING_A_TENANT
+        route.key for route in ROUTES if get_current_user not in route.calls
+    } == _ROUTES_THAT_NEVER_BIND_A_TENANT
+
+
+def test_the_routes_with_no_tenant_bound_do_not_bind_a_tenant() -> None:
+    """The two exemptions agree: anything allowed to open an unscoped session
+    is, necessarily, a route that resolves no tenant."""
+    assert _ROUTES_WITH_NO_TENANT_BOUND <= _ROUTES_THAT_NEVER_BIND_A_TENANT
+
+
+def test_skipping_tenant_resolution_is_only_reached_by_a_known_dependency() -> None:
+    """`get_authenticated_user_id` and `get_authenticated_caller` verify the
+    cookie and stop there — no membership read, no scoped session, nothing a
+    policy would refuse. They are the only authenticated way into the set
+    above; a route that invents a third is caught here rather than inheriting
+    the exemption quietly."""
+    assert not [
+        str(route)
+        for route in ROUTES
+        if (
+            get_authenticated_user_id in route.calls
+            or get_authenticated_caller in route.calls
+        )
+        and route.key not in _ROUTES_THAT_NEVER_BIND_A_TENANT
+    ]
 
 
 def test_no_route_both_resolves_a_tenant_and_skips_resolving_one() -> None:
