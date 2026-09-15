@@ -56,6 +56,11 @@ from switch_core.bridges.agent.registration_bootstrap import (
     resolve_registration_owner_id,
 )
 from switch_core.bridges.resource.service import ResourceService
+from switch_core.clients.admin_messages import PLATFORM_MARKER as _PLATFORM_MARKER
+from switch_core.clients.admin_messages import (
+    platform_on_behalf_of,
+    platform_replies_in_channel,
+)
 from switch_core.crypto import encrypt_token
 from switch_core.db.models import (
     Agent,
@@ -1713,15 +1718,25 @@ class ProtocolService:
 
     @staticmethod
     def _timeline_entry(
-        message: Message, attachments: list[MessageAttachment]
+        message: Message,
+        attachments: list[MessageAttachment],
+        sender_kinds: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Build the agent-facing entry for a recorded row.
 
         An arrival is stored with no body — how it reads is this function's to
         decide, not the writer's — so the sentence is composed here and can be
         changed without rewriting history.
+
+        ``sender_kinds`` is an optional pre-resolved map of sender mxid to
+        kind ("user", "agent", "platform"). When absent, ``sender_kind`` is
+        read from the message content: "platform" for a PLATFORM_MARKER, else
+        None.
         """
         name = message.sender_name or message.sender_id
+        sender_kind = (sender_kinds or {}).get(message.sender_id)
+        if sender_kind is None and _PLATFORM_MARKER in (message.content or {}):
+            sender_kind = "platform"
         if message.event_type == MEMBERSHIP_EVENT_TYPE:
             return {
                 "id": message.transport_event_id,
@@ -1732,7 +1747,7 @@ class ProtocolService:
                 "timestamp": _epoch_ms(message.sent_at),
                 "attachments": [],
             }
-        return {
+        entry: dict[str, Any] = {
             "id": message.transport_event_id,
             "kind": "message",
             "sender": message.sender_id,
@@ -1750,10 +1765,24 @@ class ProtocolService:
                 for attachment in attachments
             ],
         }
+        if sender_kind is not None:
+            entry["sender_kind"] = sender_kind
+        person = platform_on_behalf_of(message.content or {})
+        if person is not None:
+            entry["on_behalf_of"] = person.name
+        return entry
 
     @staticmethod
     def _thread_root_id(message: Message) -> str:
-        """A threaded reply belongs to its root; anything else is its own root."""
+        """A threaded reply belongs to its root; anything else is its own root.
+
+        A platform message flagged reply_in_channel (a template's kickoff
+        text, threaded under its headline only to keep the channel tidy) is
+        read as its own root, so an agent catching up sees the work it starts
+        at the top level and answers there.
+        """
+        if platform_replies_in_channel(message.content or {}):
+            return message.transport_event_id
         return message.thread_root_event_id or message.transport_event_id
 
     async def read_context(
@@ -1776,8 +1805,10 @@ class ProtocolService:
             {"root": <entry>, "replies": [<entry>, ...]}
 
         An <entry> is {"id", "kind", "sender", "sender_name", "body",
-        "timestamp", "attachments"}. `kind` is "message" for something someone
-        said and "room_join" for an arrival. Top-level entries are roots with
+        "timestamp", "attachments"}, plus "sender_kind" ("platform" for a
+        message the Switch app posted) and "on_behalf_of" (the person a
+        platform message spoke for) when they apply. `kind` is "message" for
+        something someone said and "room_join" for an arrival. Top-level entries are roots with
         an empty replies list; replies are ordered oldest-first within a
         thread. A root that falls outside the fetched window but has a reply
         inside it is fetched alongside; if no record of it exists it is
