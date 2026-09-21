@@ -78,11 +78,40 @@ def _render(attributes: list[dict[str, Any]]) -> str:
     return "  {" + ", ".join(f"{k}={v}" for k, v in sorted(flat.items())) + "}"
 
 
+def _summarise_events(records: list[dict[str, Any]]) -> list[str]:
+    """Product events: the name, then every property.
+
+    Nothing is truncated. The point of watching these is to check exactly what
+    a deployment would report, and a property elided as "… and 6 more" is
+    precisely the one that might not belong on the wire.
+    """
+    lines = []
+    for record in records:
+        attributes = _attributes(record.get("attributes", []))
+        name = attributes.pop("event.name", record.get("eventName", "?"))
+        if record.get("eventName") != name:
+            # Both places must carry it: the relay filters on the attribute and
+            # the exporter reads the field. One without the other is accepted
+            # with a 200 and then silently dropped.
+            lines.append(f"  !! {name}: eventName field is {record.get('eventName')!r}")
+        lines.append(f"  ▸ {name}")
+        for key in sorted(attributes):
+            lines.append(f"      {key:<34} {attributes[key]!r}")
+    return lines
+
+
 def _summarise_logs(payload: dict[str, Any]) -> list[str]:
     lines = []
     for resource in payload.get("resourceLogs", []):
         for scope in resource.get("scopeLogs", []):
             records = scope.get("logRecords", [])
+            # A product event is a log record carrying an event name, and it
+            # wants the opposite treatment from a log line: every property
+            # matters and there is one record per request, where a log batch
+            # is many records of which the first few are representative.
+            if records and "eventName" in records[0]:
+                lines.extend(_summarise_events(records))
+                continue
             levels = Counter(record.get("severityText", "?") for record in records)
             lines.append(
                 f"  {len(records)} record(s): "
@@ -107,6 +136,8 @@ def _summarise_logs(payload: dict[str, Any]) -> list[str]:
 
 class Handler(BaseHTTPRequestHandler):
     raw = False
+    reject = 0
+    fail_with = 0
     # Keep-alive, like a real collector. The default is HTTP/1.0, where closing
     # the connection delimits the response — which curl accepts and a pooling
     # client reports as "server disconnected without sending a response".
@@ -116,7 +147,25 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
         # Answer first: a slow collector is indistinguishable from a broken one.
-        reply = b'{"partialSuccess":{}}'
+        if self.fail_with:
+            self.send_response(self.fail_with)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            print(
+                f"[{datetime.now(UTC):%H:%M:%S}] refused with {self.fail_with}",
+                flush=True,
+            )
+            return
+
+        # A 200 does not mean a collector kept anything: OTLP reports partial
+        # success in the body. `--reject` is how to check the sender notices.
+        reply = (
+            json.dumps(
+                {"partialSuccess": {"rejectedLogRecords": str(self.reject)}}
+            ).encode()
+            if self.reject
+            else b'{"partialSuccess":{}}'
+        )
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(reply)))
@@ -156,9 +205,25 @@ def main() -> None:
     parser.add_argument(
         "--raw", action="store_true", help="print the full JSON payload"
     )
+    parser.add_argument(
+        "--reject",
+        type=int,
+        default=0,
+        metavar="N",
+        help="claim N records were rejected inside a 200, to check the sender notices",
+    )
+    parser.add_argument(
+        "--fail",
+        type=int,
+        default=0,
+        metavar="CODE",
+        help="answer every request with this HTTP status instead of accepting it",
+    )
     args = parser.parse_args()
 
     Handler.raw = args.raw
+    Handler.reject = args.reject
+    Handler.fail_with = args.fail
     try:
         server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     except OSError as error:

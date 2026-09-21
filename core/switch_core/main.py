@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 import uvicorn
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
@@ -136,6 +137,9 @@ from switch_core.observability.runtime import EventLoopLag
 from switch_core.provisioning import Provisioning
 from switch_core.provisioning.postgres import PostgresProvisioning
 from switch_core.room_service import RoomService
+from switch_core.telemetry.reporter import SnapshotReporter
+from switch_core.telemetry.service import TelemetryService
+from switch_core.telemetry.setup import build_telemetry
 from switch_core.tenant_context import no_tenant
 from switch_core.transport.ephemeral import EphemeralBus
 from switch_core.transport.invites import InviteBus
@@ -212,6 +216,46 @@ async def _connection_sweep_loop(protocol: ProtocolService, lag: EventLoopLag) -
                 )
         except Exception:
             logger.exception("Connection sweep failed")
+
+
+# The innermost of three nested budgets: under
+# `observability.logs.SHUTDOWN_FLUSH_SECONDS`, itself under
+# `_FORCED_EXIT_GRACE_SECONDS`.
+_TELEMETRY_DRAIN_SECONDS = 1.0
+
+
+async def _drain_telemetry(
+    telemetry: TelemetryService, http_client: httpx.AsyncClient | None
+) -> None:
+    """Let in-flight product events finish, then close their client.
+
+    Never raises and never overruns: a relay that stopped answering must not
+    hold the process past the point where it is killed.
+    """
+    try:
+        async with asyncio.timeout(_TELEMETRY_DRAIN_SECONDS):
+            await telemetry.aclose()
+    except TimeoutError:
+        logger.warning(
+            "Gave up waiting for in-flight telemetry after %.1fs; those events "
+            "are lost.",
+            _TELEMETRY_DRAIN_SECONDS,
+        )
+    except Exception:
+        logger.warning("Telemetry shutdown failed; continuing.", exc_info=True)
+    if http_client is not None:
+        try:
+            await http_client.aclose()
+        except Exception:
+            logger.warning("Telemetry HTTP client did not close.", exc_info=True)
+
+
+async def _snapshot_loop(reporter: SnapshotReporter) -> None:
+    # `no_tenant` for the reason every other long-lived task does it: the
+    # snapshot binds each tenant in turn as it counts, and must not inherit
+    # whichever one happened to be bound when the task was created.
+    with no_tenant():
+        await reporter.run_forever()
 
 
 class _QuietPollFilter(logging.Filter):
@@ -342,6 +386,12 @@ async def run(config: SwitchConfig) -> None:
     event_buffer = EventBuffer()
     connector_store = ServerConnectorStore()
 
+    # ── Product telemetry ────────────────────────────────────────────────────
+    # Before the services that report through it, switched on or not.
+    telemetry, installed_at, telemetry_http = await build_telemetry(
+        config, session_factory, switch_core_version()
+    )
+
     # ── Resource service ─────────────────────────────────────────────────────
     resource_service = ResourceService(
         reference_store=reference_store,
@@ -350,6 +400,7 @@ async def run(config: SwitchConfig) -> None:
         package_store=package_store,
         room_link_store=room_link_store,
         session_factory=session_factory,
+        telemetry=telemetry,
     )
     # Once per tenant, not once for the deployment: `reference_types` is
     # scoped, so "every stored type a built-in shadows" is a question asked of
@@ -441,6 +492,7 @@ async def run(config: SwitchConfig) -> None:
         session_factory=session_factory,
         config=config,
         client_factory=client_factory,
+        telemetry=telemetry,
     )
 
     # ── Room service ─────────────────────────────────────────────────────────
@@ -453,6 +505,7 @@ async def run(config: SwitchConfig) -> None:
         collab_bridge_store=bridge_store,
         resource_service=resource_service,
         session_factory=session_factory,
+        telemetry=telemetry,
     )
     collab_lifecycle._room_service = room_service
 
@@ -490,7 +543,12 @@ async def run(config: SwitchConfig) -> None:
         session_factory=session_factory,
         config=config,
         connections=connections,
+        telemetry=telemetry,
     )
+    # Every close reports, whichever of the five paths did it — and only for a
+    # connection the handler saw start.
+    connections.set_close_listener(protocol.sessions.on_close)
+
     # ── Server-side connector lifecycle ─────────────────────────────────────
     connector_lifecycle = ServerSideConnectorLifecycleService(
         connector_store=connector_store,
@@ -498,6 +556,7 @@ async def run(config: SwitchConfig) -> None:
         protocol=protocol,
         session_factory=session_factory,
         encryption_secret=config.jwt_secret_key,
+        telemetry=telemetry,
     )
     connector_lifecycle.register_connector_type(
         "opencode", OpenCodeConnector, OpenCodeConnectionConfig
@@ -621,6 +680,14 @@ async def run(config: SwitchConfig) -> None:
     # ── Lifespan: start server-side connectors once HTTP is serving ────────
     original_lifespan = agent_bridge_app.router.lifespan_context
 
+    snapshot_reporter = SnapshotReporter(
+        telemetry=telemetry,
+        session_factory=session_factory,
+        interval_hours=config.telemetry_snapshot_interval_hours,
+        installed_at=installed_at,
+        live_session_count=connections.live_connection_count,
+    )
+
     @asynccontextmanager
     async def lifespan(app: object) -> AsyncIterator[None]:
         nonlocal observability
@@ -636,13 +703,27 @@ async def run(config: SwitchConfig) -> None:
             connection_sweep_task = asyncio.create_task(
                 _connection_sweep_loop(protocol, observability.lag)
             )
+            # Only when telemetry is on: the chart tells a customer that off
+            # means nothing is collected, and the fan-out is not free.
+            snapshot_task = (
+                asyncio.create_task(_snapshot_loop(snapshot_reporter))
+                if telemetry.enabled
+                else None
+            )
             await message_listener.start()
             try:
                 yield
             finally:
                 sweep_task.cancel()
                 connection_sweep_task.cancel()
+                if snapshot_task is not None:
+                    snapshot_task.cancel()
                 await message_listener.stop()
+                # Before the operational flush, and bounded: the whole
+                # teardown runs inside `_FORCED_EXIT_GRACE_SECONDS` and a
+                # product event is the least valuable thing in it.
+                await protocol.sessions.aclose()
+                await _drain_telemetry(telemetry, telemetry_http)
                 await observability.aclose()
                 # So a probe during teardown gets a 503 rather than the last
                 # cached answer, which may still say ready.
@@ -662,6 +743,10 @@ async def run(config: SwitchConfig) -> None:
     logger.info(
         "Switch is running on http://%s:%d", config.server_host, config.server_port
     )
+
+    telemetry.emit("deployment_started", tenant_count=len(tenant_ids))
+    # The funnel's first step, and only for a deployment with an install date.
+    await telemetry.emit_milestone("deployment_installed")
 
     server_config = uvicorn.Config(
         agent_bridge_app,

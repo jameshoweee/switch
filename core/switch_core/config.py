@@ -190,7 +190,48 @@ class SwitchConfig(BaseSettings):
     # a 200 — a deployment that omitted it would look configured and appear in
     # no dashboard. Not generated per process: a fresh id each restart makes
     # one deployment look like an endless population of installs.
+    #
+    # Both streams use this value, so a deployment reporting metrics and usage
+    # is one subject downstream. Product telemetry falls back to an id in the
+    # database, which also carries the install date no env var can supply.
     deployment_id: str | None = None
+
+    # ── Product telemetry ────────────────────────────────────────────────────
+    # Usage reporting, separate from the operational export above and
+    # deliberately so. That one names *a collector* — often the customer's own
+    # — and carries how the server is behaving. This one carries how the
+    # product is being used, and goes to the analytics relay. A self-hosted
+    # deployment pointing its metrics at its own Datadog must not thereby send
+    # its usage analytics there too, and Flint must not receive a customer's
+    # operational metrics. Same wire format, same client, two destinations.
+    #
+    # **Off unless switched on, and that default is deliberate.** A Switch
+    # server may be a customer's, and the usage may be theirs, so reporting it
+    # is a decision an operator makes rather than one they discover. When this
+    # is false nothing is collected and no request is made.
+    #
+    # What is reported is fixed in `telemetry/catalogue.py` and explained in
+    # `docs/old/telemetry-events.md`: counts and durations only, never an
+    # identifier for a room, tenant, agent, user or message, and never free
+    # text. The catalogue is enforced at the boundary rather than trusted.
+    telemetry_enabled: bool = False
+
+    # Base URL of the relay, no path — `/v1/logs` is appended, the same
+    # convention `otlp_endpoint` above follows. Defaults to the company relay,
+    # which is where Switch Console already reports, so one pipeline carries
+    # both. Override to point a development run at a local sink.
+    telemetry_endpoint: str = "https://telemetry.flintai.dev"
+
+    # How long to wait on the relay before giving up on a single event.
+    # Telemetry is never worth delaying real work for, and a send that is
+    # already this late is not worth finishing.
+    telemetry_timeout_seconds: float = 10.0
+
+    # How often the daily usage snapshot is collected and sent. Hours rather
+    # than a fixed clock time so a deployment does not have to care which
+    # timezone it is in; the schedule is anchored to what was last sent, not
+    # to how long this process has been up.
+    telemetry_snapshot_interval_hours: float = 24.0
 
     server_host: str = "0.0.0.0"
     server_port: int = 8000
@@ -383,10 +424,92 @@ class SwitchConfig(BaseSettings):
                 )
         if not self.tenant_id.strip():
             raise ValueError("TENANT_ID must not be empty.")
+        # Checked whether or not telemetry is on, unlike the endpoint and the
+        # timeout below: 0 is a plausible reading of "disable the snapshot" and
+        # would instead mean "never not due", running the whole fan-out every
+        # poll. A setting whose wrong value is a busy loop is worth refusing
+        # even on a deployment that is not using it yet.
+        if self.telemetry_snapshot_interval_hours <= 0:
+            raise ValueError(
+                "TELEMETRY_SNAPSHOT_INTERVAL_HOURS must be positive, got "
+                f"{self.telemetry_snapshot_interval_hours!r}. Set "
+                "TELEMETRY_ENABLED=false to switch reporting off."
+            )
+        if self.telemetry_enabled:
+            # Checked only when telemetry is on: a deployment that never
+            # reports should not be refused boot over the shape of a setting
+            # it does not use.
+            # The same checks `_validate_observability` applies to
+            # OTLP_ENDPOINT, and for the same reasons: both are base URLs with
+            # the signal path appended, and the relay answers a misdirected
+            # post with a 404 that is logged once per event and read by nobody.
+            if self.telemetry_endpoint != self.telemetry_endpoint.strip():
+                raise ValueError(
+                    "TELEMETRY_ENDPOINT has leading or trailing whitespace: "
+                    f"{self.telemetry_endpoint!r}."
+                )
+            endpoint = urlsplit(self.telemetry_endpoint)
+            if endpoint.scheme not in ("http", "https"):
+                raise ValueError(
+                    "TELEMETRY_ENDPOINT must be an http(s) URL, got "
+                    f"{self.telemetry_endpoint!r}."
+                )
+            if not endpoint.netloc:
+                raise ValueError(
+                    "TELEMETRY_ENDPOINT must include a host, got "
+                    f"{self.telemetry_endpoint!r}."
+                )
+            if endpoint.path.strip("/"):
+                # `/v1/logs` is appended, so a value already carrying it posts
+                # to `/v1/logs/v1/logs`. The full logs URL is the form most
+                # people have seen written down, which makes pasting it here
+                # the obvious mistake rather than an unlikely one.
+                raise ValueError(
+                    "TELEMETRY_ENDPOINT is the relay's base URL and the signal "
+                    "path is appended to it, so it must have no path of its "
+                    f"own. Got {self.telemetry_endpoint!r} — drop the "
+                    f"{endpoint.path!r}."
+                )
+            if endpoint.query or endpoint.fragment:
+                raise ValueError(
+                    "TELEMETRY_ENDPOINT must be a bare base URL: a query or "
+                    "fragment is dropped when the signal path is appended, so "
+                    "it would silently never be sent. Got "
+                    f"{self.telemetry_endpoint!r}."
+                )
+            if self.telemetry_timeout_seconds <= 0:
+                raise ValueError(
+                    "TELEMETRY_TIMEOUT_SECONDS must be positive, got "
+                    f"{self.telemetry_timeout_seconds!r}."
+                )
+
         if self.template_max_bytes < 1:
             raise ValueError(
                 f"TEMPLATE_MAX_BYTES must be at least 1, got {self.template_max_bytes}."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_deployment_id(self) -> "SwitchConfig":
+        """The id's shape, checked wherever it is set.
+
+        Separate from `_validate_observability` because both streams now use
+        this value: product telemetry prefers it over the id generated into the
+        database, so a malformed one reaches the relay on a deployment that has
+        named no collector at all and would never run that validator. The relay
+        requires a canonical UUID and drops what arrives without one — with a
+        200, in silence — so the wrong shape here is not a degraded send, it is
+        no send at all.
+        """
+        if self.deployment_id is None:
+            return self
+        try:
+            uuid.UUID(self.deployment_id)
+        except ValueError as error:
+            raise ValueError(
+                f"DEPLOYMENT_ID must be a UUID, got {self.deployment_id!r}. "
+                "The relay's guard rejects anything else, silently."
+            ) from error
         return self
 
     @model_validator(mode="after")
@@ -436,14 +559,6 @@ class SwitchConfig(BaseSettings):
                 "does so silently, so without one this server would report "
                 "nothing while looking correctly configured."
             )
-        try:
-            uuid.UUID(self.deployment_id)
-        except ValueError as error:
-            raise ValueError(
-                f"DEPLOYMENT_ID must be a UUID, got {self.deployment_id!r}. "
-                "The collector's guard rejects anything else."
-            ) from error
-
         for name, value in (
             ("OTLP_TIMEOUT_SECONDS", self.otlp_timeout_seconds),
             ("OTLP_EXPORT_INTERVAL_SECONDS", self.otlp_export_interval_seconds),
