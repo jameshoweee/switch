@@ -95,6 +95,10 @@ class CollaborationBridgeLifecycleService:
         # (see CollaborationAdapter.exclusive_resource). Lets a second
         # claimant be refused by name instead of failing on the resource.
         self._held_resources: dict[str, str] = {}
+        # Started and not deliberately stopped. A crash removes a bridge from
+        # `_bridges` and leaves it here, which is what makes "configured but no
+        # longer running" answerable.
+        self._started: set[str] = set()
         # The one listener every bridge that gets called back shares, and each
         # running bridge's place on it. Owned here rather than by an adapter
         # because the port is the process's, not a bridge's: two Mattermost
@@ -555,6 +559,7 @@ class CollaborationBridgeLifecycleService:
         )
         self._bridges[bridge_id] = bridge_core
         self._tasks[bridge_id] = task
+        self._started.add(bridge_id)
         if wanted is not None:
             self._held_resources[bridge_id] = wanted
 
@@ -670,6 +675,7 @@ class CollaborationBridgeLifecycleService:
 
         self._bridges.pop(bridge_id, None)
         self._held_resources.pop(bridge_id, None)
+        self._started.discard(bridge_id)
         logger.info("Stopped collaboration bridge %s", bridge_id)
 
     async def restart(self, bridge_id: str) -> None:
@@ -741,6 +747,23 @@ class CollaborationBridgeLifecycleService:
 
     def get(self, bridge_id: str) -> BridgeCore | None:
         return self._bridges.get(bridge_id)
+
+    def expected_count(self) -> int:
+        """Bridges that were started and have not been stopped deliberately."""
+        return len(self._started)
+
+    def running_count(self) -> int:
+        """Of those, how many still have a task that has not finished.
+
+        A bridge's task runs until shutdown, so a finished one has stopped
+        serving whether it raised or returned.
+        """
+        running = 0
+        for bridge_id in self._started:
+            task = self._tasks.get(bridge_id)
+            if bridge_id in self._bridges and task is not None and not task.done():
+                running += 1
+        return running
 
     def bridges_for_tenant(self, tenant_id: str) -> list[BridgeCore]:
         """Running bridges belonging to `tenant_id`, and none other.
