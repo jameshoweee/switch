@@ -178,21 +178,63 @@ async def test_dropping_a_room_does_not_report_a_gap() -> None:
     assert [item.seq for item in q.read_from(AGENT, 0)] == [2]
 
 
-async def test_a_filtered_out_event_does_not_strand_the_poll_cursor() -> None:
-    """The all-rooms cursor advances past what the filter excluded.
-
-    Left behind them it parks below the head for good; retention eventually
-    trims them, and the next read raises `CursorExpiredError` and logs that the
-    poller missed events. Nothing was missed — they were filtered.
+async def test_the_cursor_advances_past_what_the_reader_can_never_want() -> None:
+    """Unaddressed chatter is excluded on a property of the event, not on who
+    the agent is, so the notification reader will never want it and the cursor
+    is free to move past it. Left behind it, the cursor parks below the head
+    until retention trims it and the next read reports a gap that never was.
     """
     q = EventBuffer()
     q.enqueue(AGENT, ROOM, _message(addressed=False))
-    q.enqueue(AGENT, "room-2", _message(addressed=False, room_id="room-2"))
-    q.enqueue(AGENT, "room-2", _message(addressed=False, room_id="room-2"))
+    q.enqueue(AGENT, ROOM, _message(addressed=False))
 
-    # Removed from both: everything retained is filtered out.
-    assert await q.poll(AGENT, timeout=0, rooms=set()) == []
-    assert q._cursors[AGENT]["legacy:all"] == 3
+    assert await q.poll_notifications(AGENT, timeout=0, rooms={ROOM}) == []
+    assert q._cursors[AGENT]["legacy:notifications"] == 2
+
+
+async def test_the_cursor_does_not_advance_past_a_room_joined_later() -> None:
+    """Membership is not a property of the event, so it can change.
+
+    A poll reads the agent's rooms once; anything arriving for a room it joins
+    while that poll is parked is filtered against the older set. Confirming
+    past it would put the cursor beyond an event the agent is entitled to, and
+    no later poll would ever reach it again — it would sit in the buffer,
+    retained and unreachable, until it aged out.
+    """
+    q = EventBuffer()
+    q.enqueue(AGENT, "room-2", _message(addressed=True, room_id="room-2"))
+
+    assert await q.poll(AGENT, timeout=0, rooms={ROOM}) == []
+    assert q._cursors[AGENT]["legacy:all"] == 0
+
+    polled = await q.poll(AGENT, timeout=0, rooms={ROOM, "room-2"})
+    assert [event.room_id for event in polled] == ["room-2"]
+
+
+async def test_the_notification_stream_also_survives_a_room_joined_later() -> None:
+    """The same rule on the stream carrying what was said *to* the agent."""
+    q = EventBuffer()
+    q.enqueue(AGENT, "room-2", _message(addressed=True, room_id="room-2"))
+
+    assert await q.poll_notifications(AGENT, timeout=0, rooms={ROOM}) == []
+    polled = await q.poll_notifications(AGENT, timeout=0, rooms={ROOM, "room-2"})
+    assert [event.room_id for event in polled] == ["room-2"]
+
+
+async def test_a_room_reader_still_advances_past_other_rooms() -> None:
+    """`poll_room`'s filter is the reader's own scope, not a membership snapshot.
+
+    `legacy:room:X` will never want room Y whatever the agent joins later, so
+    parking its cursor behind Y's events would strand it for no gain.
+    """
+    q = EventBuffer()
+    q.enqueue(AGENT, "room-2", _message(addressed=True, room_id="room-2"))
+    q.enqueue(AGENT, ROOM, _message(addressed=True))
+
+    polled = await q.poll_room(AGENT, ROOM, timeout=0)
+
+    assert [event.room_id for event in polled] == [ROOM]
+    assert q._cursors[AGENT][f"legacy:room:{ROOM}"] == 2
 
 
 async def test_remove_clears_notification_queue() -> None:

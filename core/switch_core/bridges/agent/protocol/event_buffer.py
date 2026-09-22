@@ -315,6 +315,7 @@ class EventBuffer:
             f"legacy:room:{room_id}",
             timeout=timeout,
             rooms={room_id},
+            rooms_are_membership=False,
         )
 
     async def poll_notifications(
@@ -341,14 +342,16 @@ class EventBuffer:
         timeout: float,
         rooms: set[str],
         notifiable_only: bool = False,
+        rooms_are_membership: bool = True,
     ) -> list[AgentEvent]:
-        events = self._legacy_take(agent_id, reader_id, rooms, notifiable_only)
+        args = (agent_id, reader_id, rooms, notifiable_only, rooms_are_membership)
+        events = self._legacy_take(*args)
         if events:
             return events
 
         await self.wait(agent_id, timeout)
 
-        return self._legacy_take(agent_id, reader_id, rooms, notifiable_only)
+        return self._legacy_take(*args)
 
     def _legacy_take(
         self,
@@ -356,22 +359,47 @@ class EventBuffer:
         reader_id: str,
         rooms: set[str],
         notifiable_only: bool,
+        rooms_are_membership: bool,
     ) -> list[AgentEvent]:
-        """One read, with the reader's cursor moved past everything scanned.
+        """One read, moving the cursor past what this reader can never want.
 
-        Past everything *scanned*, not merely everything returned. A legacy
-        read has no limit, so it always reaches the end of the buffer, and
-        events the filter excluded are events this reader will never want. Left
-        behind them the cursor would park below the head indefinitely; when
-        retention eventually trimmed them the next read would raise
-        `CursorExpiredError` and log that the poller missed events, which would
-        be a false alarm — they were filtered, not lost.
+        Past what it can never want, and no further. A legacy read has no
+        limit, so it always reaches the end of the buffer, and leaving the
+        cursor behind an event the filter excluded parks it below the head
+        indefinitely — until retention trims it and the next read reports a
+        gap that never happened.
+
+        Which exclusions are permanent depends on the filter.
+        `notifiable_only` tests a property of the event, which is fixed, so
+        those can be skipped for good. A room set taken from membership is not
+        fixed: an agent added to a room the buffer already holds events for
+        would find the cursor already past them, and they would never be
+        delivered. `poll_room`'s filter is the reader's own scope rather than a
+        membership snapshot, so there the exclusions are permanent too — hence
+        `rooms_are_membership`.
         """
-        scanned_through = self.head(agent_id)
         cursor = self._legacy_cursor(agent_id, reader_id)
         events = self._legacy_read(agent_id, reader_id, cursor, rooms, notifiable_only)
-        self.confirm(agent_id, reader_id, scanned_through)
+        if rooms_are_membership:
+            self.confirm(
+                agent_id, reader_id, self._last_seq_in_rooms(agent_id, cursor, rooms)
+            )
+        else:
+            self.confirm(agent_id, reader_id, self.head(agent_id))
         return [item.event for item in events]
+
+    def _last_seq_in_rooms(self, agent_id: str, after_seq: int, rooms: set[str]) -> int:
+        """The newest retained event after `after_seq` in one of `rooms`.
+
+        `after_seq` itself when there is none, so a caller confirming this
+        never moves a cursor over an event held for a room the agent is not in
+        yet.
+        """
+        last = after_seq
+        for item in self._events.get(agent_id, ()):
+            if item.seq > after_seq and item.room_id in rooms:
+                last = item.seq
+        return last
 
     def _legacy_cursor(self, agent_id: str, reader_id: str) -> int:
         readers = self._cursors.setdefault(agent_id, {})
