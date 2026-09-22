@@ -499,14 +499,12 @@ class ConnectionRegistry:
     def release_room_everywhere(self, agent_id: str, room_id: str) -> None:
         """Take the room off every one of this agent's connections.
 
-        For a removal, where no connection is entitled to it any more. A claim
-        outlives the membership it was checked against — `require_room_member`
-        runs when the room is claimed and never again — so a session that
-        claimed the room keeps covering it until its stream ends.
+        A claim outlives the membership it was checked against:
+        `require_room_member` runs when the room is claimed and never again.
 
-        Every connection, not only the live ones: a connection whose heartbeat
-        has lapsed still holds its claim, and a client that reconnects to it
-        would resume covering the room.
+        Every connection, not only the live ones — a lapsed connection still
+        holds its claim, and a client reconnecting to it resumes covering the
+        room.
         """
         for cid in self._by_agent.get(agent_id, set()):
             conn = self._by_id.get(cid)

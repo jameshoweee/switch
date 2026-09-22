@@ -2018,11 +2018,10 @@ class ProtocolService:
         without the same check this call would hand over events from a room
         the agent has since been removed from.
 
-        A removal already empties the buffer of that room's events (see
-        `AgentClient.on_removed`), so this is the second of two answers rather
-        than the only one. It is kept because it is the authoritative one: the
-        removal signal is in-process, and this is a read of the table the
-        removal wrote.
+        `AgentClient.on_removed` already empties the buffer of a removed
+        room's events, so this is the second of two answers. It is the
+        authoritative one: that signal is in-process, and this reads the table
+        the removal wrote.
         """
         async with self.session_factory() as session:
             await self.agent_session_store.touch_heartbeat(session, agent_id, None)

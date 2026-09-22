@@ -347,17 +347,10 @@ class AgentClient(ClientBase[ClientConfig]):
         """Forget the room's events, everywhere this agent could still read them.
 
         Dropping the subscription only stops what has not been read yet. What
-        has already been read is in the event buffer, which is keyed by agent
-        and knows nothing about who is in what: it holds each event for the
-        retention window and will serve it to a long poll, to the notification
-        stream, or to an SSE reader resuming from an old cursor. Without this
-        an agent removed from a room keeps being handed that room's backlog
-        from every one of those, for as long as the window lasts.
-
-        Doing it here, once, is why the readers do not each have to re-derive
-        membership. The poll paths check it against the database anyway,
-        because that is the authoritative answer and this signal is in-process;
-        the stream has only this.
+        has is in the event buffer for the whole retention window, and is
+        served from there to a long poll, to the notification stream, and to an
+        SSE reader resuming from an old cursor — the last of which has no
+        membership of its own to apply.
         """
         meta = await self._resolve_room_meta(room.room_id)
         if meta is None:

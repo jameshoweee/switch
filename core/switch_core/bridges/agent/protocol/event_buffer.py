@@ -246,17 +246,13 @@ class EventBuffer:
     def drop_room(self, agent_id: str, room_id: str) -> None:
         """Forget everything retained for this agent in one room.
 
-        Called when the agent is removed from the room. The buffer is keyed by
-        agent, so an event queued while it was a member stays readable after it
-        is not; every reader would otherwise have to re-derive membership for
-        itself, and the one that cannot — an SSE stream, which holds no session
-        to ask with — would keep replaying the room to a non-member on every
-        resume.
+        Called when the agent is removed from it. The buffer is keyed by agent
+        and knows nothing about who is in what, so an event queued while it was
+        a member stays readable after it is not.
 
-        Sequence numbers are untouched and no gap is recorded. A reader that
-        skips over the removed events has not missed anything it was entitled
-        to, and telling it otherwise would send it off to re-read the context
-        of a room it is no longer in.
+        Sequence numbers are untouched and no gap is recorded: a reader that
+        skips these has missed nothing it was entitled to, and saying otherwise
+        would send it to re-read the context of a room it is not in.
         """
         events = self._events.get(agent_id)
         if not events:

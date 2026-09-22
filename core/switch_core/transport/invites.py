@@ -118,15 +118,11 @@ class InviteBus:
         Nothing is returned, unlike `invite`: the caller has nothing to fall
         back to. A client that is not running holds no subscription to drop,
         and one that starts later reads its rooms from the table the removal
-        already updated, so "nobody was listening" is the expected answer
-        rather than a decision point.
+        already updated, so "nobody was listening" is the expected answer.
 
-        The one case that is *not* expected is a client listening for
-        invitations but not for removals, which would mean a live transport
-        being told about every room it gains and none it loses. `register`
-        makes that unrepresentable; this says so out loud if it ever happens
-        anyway, because the symptom on its own is a room going quietly on
-        being delivered to someone no longer in it.
+        A client listening for invitations but not removals is not expected —
+        `register` makes it unrepresentable — and is reported rather than left
+        to surface as a room quietly delivered to someone no longer in it.
         """
         handler = self._removal_handlers.get(client_id)
         if handler is None:

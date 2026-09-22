@@ -227,15 +227,9 @@ class PostgresTransport:
         was away is not delivered here. That is a delivery-cursor question,
         and delivery cursors are a layer above this one.
         """
-        # Before the rooms are read, not after they are subscribed. Reading
-        # `joined_rooms` and watching each room is several round trips, and a
-        # removal rung during them would find nobody listening — after which
-        # `_watch` would go on to subscribe to the room whose membership row
-        # had just been deleted, and the client would read a room it is not in
-        # until the process restarted. An invitation arriving early is
-        # harmless because the caller writes the membership row when nobody
-        # answers; a removal has no such fallback, so the listener goes up
-        # first and `_watch` re-checks the row before it subscribes.
+        # Before the rooms are read, not after they are subscribed: reading
+        # them and watching each is several round trips, and a removal rung
+        # during those has no membership row for the caller to fall back to.
         self._invites.register(self.client_id, self._on_invited, self._on_removed)
         self._receiving = True
         try:
@@ -386,13 +380,8 @@ class PostgresTransport:
         depended on hearing its own join.
 
         The slot in `_watching` is claimed before the head is read, so a
-        removal landing on that await is not a no-op it never sees: `_unwatch`
-        takes the entry back, and finding it gone is this method's signal to
-        subscribe to nothing. Keying the "already watching" test on `_watching`
-        rather than on `_cursors` matters for the same reason — `_watching` is
-        the fact the rest of the class tests, and a guard on the other map
-        would turn any divergence between them into a room that can never be
-        re-subscribed.
+        removal landing on that await has something to take back; finding the
+        claim gone afterwards is the signal to subscribe to nothing.
         """
         room_id, tenant_id = await self._resolve_room_and_tenant(transport_room_id)
         if room_id in self._watching:
@@ -417,10 +406,8 @@ class PostgresTransport:
                         return
                     seq = await self._message_store.head_seq(session, room_id)
             except Exception:
-                # The claim is only a claim until the subscription is taken.
-                # Left behind, it would make every later `_watch` return early
-                # on a room nothing is subscribed to — the permanent silence
-                # this guard exists to prevent, arrived at from the other side.
+                # A claim left behind would make every later `_watch` return
+                # early on a room nothing is subscribed to.
                 self._release_claim(room_id, transport_room_id)
                 raise
         if self._watching.get(room_id) != transport_room_id:
@@ -441,8 +428,7 @@ class PostgresTransport:
 
         The cursor goes with the subscription. Keeping it would mean a client
         added back to the room resumed from where it left off and was handed
-        everything said while it was out, which is the leak this closes said a
-        different way.
+        everything said while it was out.
         """
         room_id = self._room_ids.get(transport_room_id)
         if room_id is None or room_id not in self._watching:
@@ -465,12 +451,7 @@ class PostgresTransport:
         self._pending.discard(room_id)
 
     def _unwatch_all(self) -> None:
-        """Drop every room, through the same path a single removal takes.
-
-        A second copy of `_unwatch`'s body is a second thing to keep in step,
-        and the copies had already drifted — the queued wake-up this discards
-        was left behind by the other one.
-        """
+        """Drop every room, through the same path a single removal takes."""
         for transport_room_id in list(self._watching.values()):
             self._unwatch(transport_room_id)
 
@@ -513,12 +494,8 @@ class PostgresTransport:
         dropping it.
 
         Every delivery is a suspension point, so the subscription is re-read
-        per row rather than once at the top. A removal landing mid-page must
-        stop the rows it has not reached — and, just as important, must not be
-        undone by them: writing the cursor for a row after `_unwatch` popped it
-        would put the room back in `_cursors` with nothing in `_watching`, and
-        the client would then be silent in that room for good on being added
-        back.
+        per row. A removal landing mid-page has to stop the rows it has not
+        reached, and must not be undone by a cursor write after it.
         """
         transport_room_id = self._watching.get(room_id)
         if transport_room_id is None:
