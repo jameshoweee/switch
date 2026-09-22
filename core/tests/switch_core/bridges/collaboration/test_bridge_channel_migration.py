@@ -60,17 +60,24 @@ class _Session:
 def _make_bridge(rooms: dict[str, SimpleNamespace]) -> BridgeCore:
     bridge = BridgeCore.__new__(BridgeCore)
     bridge._bridge_id = "bridge-1"
+    bridge._bridge_tenant_id = "tenant-1"
+    bridge._room_tenants = {}
     bridge._channel_locks = {}
     bridge._channel_to_room = {}
     bridge._room_to_channel = {}
     bridge._adapter = _Adapter()  # type: ignore[assignment]
     bridge._room_store = _RoomStore(rooms)  # type: ignore[assignment]
     bridge._session_factory = _Session  # type: ignore[assignment]
+    bridge._session_publisher = None
+    bridge._session_publication_task = None
+    bridge._session_interactions = None
     return bridge
 
 
 def _room(room_id: str = "room-uuid") -> SimpleNamespace:
-    return SimpleNamespace(id=room_id, matrix_room_id=f"!{room_id}:switch.local")
+    return SimpleNamespace(
+        id=room_id, tenant_id="tenant-1", matrix_room_id=f"!{room_id}:switch.local"
+    )
 
 
 def test_the_handler_is_installed_before_the_adapter_starts() -> None:

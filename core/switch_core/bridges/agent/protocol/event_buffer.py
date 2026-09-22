@@ -26,11 +26,29 @@ import asyncio
 import logging
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from switch_core.bridges.agent.protocol.types import AgentEvent
+from switch_core.observability.catalogue import AGENT_EVENTS_DROPPED
+from switch_core.observability.metrics import metrics
 
 logger = logging.getLogger(__name__)
+
+# The rooms an agent is in, asked for at the moment a read needs them. A long
+# poll can be parked for its whole timeout, so membership taken once up front
+# would be answering a question from before the wait.
+RoomsProvider = Callable[[], Awaitable[set[str]]]
+
+
+def fixed_rooms(rooms: set[str]) -> RoomsProvider:
+    """A provider for a caller whose room set cannot change under it."""
+
+    async def _provider() -> set[str]:
+        return rooms
+
+    return _provider
+
 
 # Maximum events retained per agent. Beyond this the oldest are dropped and the
 # agent is flagged with a gap. Sized for chat-rate traffic: an agent would have
@@ -241,6 +259,38 @@ class EventBuffer:
         self._cursors.pop(agent_id, None)
         self._dropped_through.pop(agent_id, None)
 
+    def drop_room(self, agent_id: str, room_id: str) -> None:
+        """Forget everything retained for this agent in one room.
+
+        Called when the agent is removed from the room. The buffer is keyed by
+        agent, so an event queued while it was a member stays readable after it
+        is not; every reader would otherwise have to re-derive membership for
+        itself, and the one that cannot — an SSE stream, which holds no session
+        to ask with — would keep replaying the room to a non-member on every
+        resume.
+
+        Sequence numbers are untouched and no gap is recorded. A reader that
+        skips over the removed events has not missed anything it was entitled
+        to, and telling it otherwise would send it off to re-read the context
+        of a room it is no longer in.
+        """
+        events = self._events.get(agent_id)
+        if not events:
+            return
+        kept = [item for item in events if item.room_id != room_id]
+        dropped = len(events) - len(kept)
+        if not dropped:
+            return
+        events.clear()
+        events.extend(kept)
+        logger.info(
+            "[EVENT-BUF] dropped %s retained event(s) for agent=%s room=%s: "
+            "no longer a member",
+            dropped,
+            agent_id,
+            room_id,
+        )
+
     # ------------------------------------------------------------------
     # Legacy long-poll compatibility
     #
@@ -256,14 +306,20 @@ class EventBuffer:
     # ------------------------------------------------------------------
 
     async def poll(
-        self, agent_id: str, timeout: float = 30, rooms: set[str] | None = None
+        self, agent_id: str, *, rooms: RoomsProvider, timeout: float = 30
     ) -> list[AgentEvent]:
-        """Everything queued for this agent, optionally limited to `rooms`.
+        """Everything queued for this agent in the rooms it is in.
 
-        `rooms` is how the caller applies membership. The buffer is keyed by
-        agent and knows nothing about who is in what, so an event queued while
-        the agent was a member stays queued after it is removed; passing the
-        rooms it is in now is what keeps that event from being handed over.
+        `rooms` is how the caller applies membership, and it is required: the
+        buffer is keyed by agent and knows nothing about who is in what, so an
+        event queued while the agent was a member stays queued after it is
+        removed. A default would make the leak the thing a new caller gets for
+        free.
+
+        It is asked for rather than passed, because this waits. A set taken
+        before the wait is a set from up to `timeout` ago, so a room the agent
+        joined while the call was parked would have its first events filtered
+        out of the very poll the arrival woke.
         """
         return await self._legacy_poll(
             agent_id, "legacy:all", timeout=timeout, rooms=rooms
@@ -273,14 +329,26 @@ class EventBuffer:
         self, agent_id: str, room_id: str, timeout: float = 30
     ) -> list[AgentEvent]:
         return await self._legacy_poll(
-            agent_id, f"legacy:room:{room_id}", timeout=timeout, rooms={room_id}
+            agent_id,
+            f"legacy:room:{room_id}",
+            timeout=timeout,
+            rooms=fixed_rooms({room_id}),
         )
 
     async def poll_notifications(
-        self, agent_id: str, timeout: float = 30
+        self, agent_id: str, *, rooms: RoomsProvider, timeout: float = 30
     ) -> list[AgentEvent]:
+        """The notifiable half of `poll`, under the same membership rule.
+
+        This is the stream carrying messages addressed at the agent, so it is
+        the one a removal matters most on.
+        """
         return await self._legacy_poll(
-            agent_id, "legacy:notifications", timeout=timeout, notifiable_only=True
+            agent_id,
+            "legacy:notifications",
+            timeout=timeout,
+            rooms=rooms,
+            notifiable_only=True,
         )
 
     async def _legacy_poll(
@@ -289,20 +357,41 @@ class EventBuffer:
         reader_id: str,
         *,
         timeout: float,
-        rooms: set[str] | None = None,
+        rooms: RoomsProvider,
         notifiable_only: bool = False,
     ) -> list[AgentEvent]:
-        cursor = self._legacy_cursor(agent_id, reader_id)
-
-        events = self._legacy_read(agent_id, reader_id, cursor, rooms, notifiable_only)
+        in_rooms = await rooms()
+        events = self._legacy_take(agent_id, reader_id, in_rooms, notifiable_only)
         if events:
-            return self._advance_legacy(agent_id, reader_id, events)
+            return events
 
         await self.wait(agent_id, timeout)
 
+        in_rooms = await rooms()
+        return self._legacy_take(agent_id, reader_id, in_rooms, notifiable_only)
+
+    def _legacy_take(
+        self,
+        agent_id: str,
+        reader_id: str,
+        rooms: set[str],
+        notifiable_only: bool,
+    ) -> list[AgentEvent]:
+        """One read, with the reader's cursor moved past everything scanned.
+
+        Past everything *scanned*, not merely everything returned. A legacy
+        read has no limit, so it always reaches the end of the buffer, and
+        events the filter excluded are events this reader will never want. Left
+        behind them the cursor would park below the head indefinitely; when
+        retention eventually trimmed them the next read would raise
+        `CursorExpiredError` and log that the poller missed events, which would
+        be a false alarm — they were filtered, not lost.
+        """
+        scanned_through = self.head(agent_id)
         cursor = self._legacy_cursor(agent_id, reader_id)
         events = self._legacy_read(agent_id, reader_id, cursor, rooms, notifiable_only)
-        return self._advance_legacy(agent_id, reader_id, events)
+        self.confirm(agent_id, reader_id, scanned_through)
+        return [item.event for item in events]
 
     def _legacy_cursor(self, agent_id: str, reader_id: str) -> int:
         readers = self._cursors.setdefault(agent_id, {})
@@ -320,7 +409,7 @@ class EventBuffer:
         agent_id: str,
         reader_id: str,
         cursor: int,
-        rooms: set[str] | None,
+        rooms: set[str],
         notifiable_only: bool,
     ) -> list[BufferedEvent]:
         try:
@@ -344,13 +433,6 @@ class EventBuffer:
             return self.read_from(
                 agent_id, resumed, rooms=rooms, notifiable_only=notifiable_only
             )
-
-    def _advance_legacy(
-        self, agent_id: str, reader_id: str, events: list[BufferedEvent]
-    ) -> list[AgentEvent]:
-        if events:
-            self.confirm(agent_id, reader_id, events[-1].seq)
-        return [item.event for item in events]
 
     # ------------------------------------------------------------------
     # Internals
@@ -381,14 +463,19 @@ class EventBuffer:
             return
 
         dropped_seq = 0
+        expired = 0
         cutoff = time.monotonic() - self._retention_seconds
         while events and events[0].appended_at < cutoff:
             dropped_seq = events.popleft().seq
+            expired += 1
+        if expired:
+            metrics().increment(AGENT_EVENTS_DROPPED, {"reason": "retention"}, expired)
 
         overflow = len(events) - self._max_events
         if overflow > 0:
             for _ in range(overflow):
                 dropped_seq = events.popleft().seq
+            metrics().increment(AGENT_EVENTS_DROPPED, {"reason": "overflow"}, overflow)
             logger.warning(
                 "[EVENT-BUF] agent=%s exceeded %s buffered events; dropped "
                 "through seq=%s — readers resuming from before this will be "

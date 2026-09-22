@@ -1,6 +1,6 @@
 [project]
 name = "switch-core"
-version = "0.25.0"
+version = "0.26.0"
 description = "Switch — AI agent orchestration and governance platform"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -50,6 +50,7 @@ Issues = "https://github.com/sandbox-quantum/switch/issues"
 
 [project.scripts]
 switch-core = "switch_core.main:main"
+switch-migrate = "switch_core.main:migrate"
 
 [build-system]
 requires = ["hatchling"]
@@ -87,6 +88,7 @@ asyncio_mode = "auto"
 addopts = "-m 'not integration'"
 markers = [
     "integration: boots real Postgres + Tuwunel via testcontainers (slow; excluded from the default run — use `just test-integration`)",
+    "no_ambient_tenant: opt out of session_factory's default tenant-zero binding, for tests asserting what is or is not bound",
 ]
 
 [tool.mypy]

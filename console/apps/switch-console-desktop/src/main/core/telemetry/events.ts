@@ -51,6 +51,7 @@ export type TelemetryAgentCreateFailure =
   | 'unauthenticated'
   | 'name_conflict'
   | 'credentials_conflict'
+  | 'already_configured'
   | 'invalid_name'
   /**
    * The two the other way into this — dropping a folder on the sidebar — hits
@@ -128,7 +129,7 @@ export type TelemetryCliFailure =
   | 'no_uninstall_command'
   | 'permission_denied'
   | 'command_failed'
-  | 'pty_open_failed'
+  | 'process_open_failed'
   | 'not_detected_after_install'
   | 'not_detected_after_update'
   | 'still_present'

@@ -22,6 +22,7 @@ from switch_core.agent_icon import normalise_icon_url, validate_icon_url
 from switch_core.aliases import check_alias_collisions, validate_alias_format
 from switch_core.attachments import parse_attachment_group
 from switch_core.authz import Action, Principal, require, require_manage
+from switch_core.bridges.agent.api.session_reporter import SessionReporter
 from switch_core.bridges.agent.api_key_cache import ApiKeyCache
 from switch_core.bridges.agent.mediation import MediationService
 from switch_core.bridges.agent.protocol.agent_detail import (
@@ -56,9 +57,15 @@ from switch_core.bridges.agent.registration_bootstrap import (
     resolve_registration_owner_id,
 )
 from switch_core.bridges.resource.service import ResourceService
+from switch_core.clients.admin_messages import PLATFORM_MARKER as _PLATFORM_MARKER
+from switch_core.clients.admin_messages import (
+    platform_on_behalf_of,
+    platform_replies_in_channel,
+)
 from switch_core.crypto import encrypt_token
 from switch_core.db.models import (
     Agent,
+    AgentRuntimeState,
     ApiKey,
     Message,
     MessageAttachment,
@@ -72,6 +79,7 @@ from switch_core.db.models import (
     Tool,
     User,
 )
+from switch_core.db.session_scope import tenant_session
 from switch_core.db.stores.agent_runtime_state_store import (
     IDLE as RUNTIME_STATE_IDLE,
 )
@@ -82,6 +90,7 @@ from switch_core.db.stores.message_store import MessageStore
 from switch_core.db.stores.room_group_store import RoomGroupStore
 from switch_core.db.stores.room_role_store import RoomRoleStore
 from switch_core.db.stores.user_store import UserStore
+from switch_core.db.tenant_lookup import all_tenant_ids, tenant_of_api_key
 from switch_core.deeplinks import deeplink_for_platform
 from switch_core.events import (
     LlmCallReport as MatrixLlmCallReport,
@@ -90,6 +99,10 @@ from switch_core.events import (
     ToolCallReport as MatrixToolCallReport,
 )
 from switch_core.messages.recorded_types import MEMBERSHIP_EVENT_TYPE
+from switch_core.sessions.attachments import normalise_mime_type
+from switch_core.telemetry import TelemetryService, emit_safely
+from switch_core.telemetry.snapshot import normalise_known_agent_type
+from switch_core.tenant_context import current_tenant_id, tenant_scope
 from switch_core.transport import (
     TransportError,
 )
@@ -114,8 +127,23 @@ if TYPE_CHECKING:
     from switch_core.db.stores.task_store import TaskStore
     from switch_core.gateway.schemas import AgentDetail
     from switch_core.room_service import RoomCreateResult, RoomService
+    from switch_core.rooms_yaml import RoomYamlService
 
 logger = logging.getLogger(__name__)
+
+
+def _age_days(created_at: object) -> float:
+    """How old a row is, in days, for reporting. Zero if unknown.
+
+    Takes `object` because the timestamp columns are annotated `Mapped[str]`
+    while carrying real `datetime`s, so the honest signature is "whatever the
+    column hands back", checked here rather than trusted.
+    """
+    if not isinstance(created_at, datetime):
+        return 0.0
+    moment = created_at if created_at.tzinfo else created_at.replace(tzinfo=UTC)
+    return max((datetime.now(UTC) - moment).total_seconds() / 86400.0, 0.0)
+
 
 # \A and \Z rather than ^ and $: Python's $ also matches before a single
 # trailing newline, which would let an identifier carry a line break.
@@ -228,6 +256,11 @@ def _describe_room(room: Room) -> RoomDescriptor:
 
 
 class ProtocolService:
+    # Class-level defaults: several tests assemble a minimal instance without
+    # `__init__`, and `emit_safely` treats None as "report nothing".
+    telemetry: TelemetryService | None = None
+    sessions: SessionReporter = SessionReporter(None)
+
     def __init__(
         self,
         *,
@@ -247,7 +280,13 @@ class ProtocolService:
         bridge_store: CollaborationBridgeStore,
         session_factory: async_sessionmaker[AsyncSession],
         config: SwitchConfig,
+        telemetry: TelemetryService | None = None,
     ) -> None:
+        self.telemetry = telemetry
+        # Pairs session start with session end. Held here because the handler
+        # that starts a session and the registry listener that ends one must
+        # be the same object — an end is reported only for a start this saw.
+        self.sessions = SessionReporter(telemetry, connections)
         self.agent_store = agent_store
         self.agent_session_store = agent_session_store
         self.agent_runtime_state_store = AgentRuntimeStateStore()
@@ -300,6 +339,7 @@ class ProtocolService:
         overwrite: bool = False,
         addressable_by_agent_ids: list[str] | None = None,
         owner_only: bool = True,
+        registration_path: str = "other",
     ) -> RegistrationResult:
         """Register or re-register an agent.
 
@@ -334,16 +374,27 @@ class ProtocolService:
         Raises:
             ValueError: name is invalid (lowercase alphanumeric, dots, hyphens,
                 or underscores — no spaces).
+            RuntimeError: no tenant is bound. Checked before anything is
+                written, because the agent's row and its bridge identities
+                both belong to a tenant and neither can be placed without one.
             InvalidIconUrl: ``icon_url`` is malformed or points somewhere unsafe.
             InvalidDisplayName: ``display_name`` is over-long or unsafe to render.
             AgentExistsError: agent with this name exists and ``overwrite`` is
-                False, or the existing agent is owned by another user (the name
-                is global, but re-registration stays within the owner's tenant).
+                False, or the existing agent is owned by another user
+                (``agents.name`` is unique per tenant, but re-registration
+                stays within the owner's tenant).
         """
         if not _VALID_NAME_RE.match(name):
             raise ValueError(
                 f"Invalid agent name: {name!r}. "
                 "Use only lowercase letters, digits, dots, hyphens, and underscores."
+            )
+
+        tenant_id = current_tenant_id()
+        if tenant_id is None:
+            raise RuntimeError(
+                "register_agent requires a bound tenant; the agent's row and "
+                "its bridge identities both belong to one"
             )
 
         validated_icon_url = normalise_icon_url(icon_url)
@@ -358,6 +409,11 @@ class ProtocolService:
         api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
         encrypted_key = encrypt_token(api_key, self.config.jwt_secret_key)
 
+        # Reported only for a genuinely new agent: a re-registration rotates a
+        # key on an agent that already existed, and counting it would make a
+        # CLI that re-registers on every launch look like adoption.
+        newly_registered = False
+
         async with self.session_factory() as session:
             existing = await self.agent_store.get_by_name(session, name)
             if existing and not overwrite:
@@ -367,12 +423,13 @@ class ProtocolService:
                     "replaces integration profile)."
                 )
             if existing and existing.owner_id != owner_id:
-                # Agent names are a global namespace, but re-registration must
-                # stay inside the caller's own tenant. Overwriting an agent
-                # owned by someone else would mint the caller a live API key for
-                # that agent (whose owner_id is left unchanged) and delete the
-                # real owner's key, i.e. a cross-tenant takeover. Report it as a
-                # plain name clash so ownership is never disclosed.
+                # `agents.name` is unique per tenant, not globally, but
+                # re-registration must still stay inside the caller's own
+                # tenant. Overwriting an agent owned by someone else would mint
+                # the caller a live API key for that agent (whose owner_id is
+                # left unchanged) and delete the real owner's key, i.e. a
+                # cross-tenant takeover. Report it as a plain name clash so
+                # ownership is never disclosed.
                 raise AgentExistsError(
                     f"Agent already exists: {name!r}. "
                     "Pass overwrite=True to re-register (rotates API key, "
@@ -423,8 +480,26 @@ class ProtocolService:
                     ),
                 )
                 logger.info("Registered agent: %s (%s)", name, agent_id)
+                newly_registered = True
 
-        await self._create_bridge_identities(name, description)
+        if newly_registered:
+            runtime = normalise_known_agent_type(metadata)
+            emit_safely(
+                self.telemetry,
+                "agent_registered",
+                {
+                    "agent_type": agent_type,
+                    "known_agent_type": runtime,
+                    "registration_path": registration_path,
+                    "has_parent": parent_agent_id is not None,
+                },
+            )
+            if self.telemetry is not None:
+                await self.telemetry.emit_milestone(
+                    "first_agent_registered", known_agent_type=runtime
+                )
+
+        await self._create_bridge_identities(tenant_id, name, description)
 
         return RegistrationResult(
             agent_id=agent_id,
@@ -459,9 +534,34 @@ class ProtocolService:
         exception, to match the HTTP registration path's handling of the
         same failure).
         Raises AgentExistsError if the name is taken and ``overwrite`` is False.
+
+        The token also decides the *tenant* the new agent and its API key land
+        in, and that is bound here rather than left to the caller. The HTTP
+        registration endpoint has ``BearerAuthMiddleware`` in front of it doing
+        the same thing. This path does not: a server-side connector calls it
+        in-process from ``server_connectors/core.py``, which binds its own
+        row's tenant around the call (``_register_agent``) — from boot, and
+        from ``POST /connectors``, where the tenant already bound is the
+        *requesting operator's*, which is not necessarily the connector's.
+
+        So the binding here is not filling a vacuum; it is overriding whatever
+        the caller had, with the one thing that is authoritative for these
+        rows. Bearer authentication later reads ``api_keys.tenant_id`` back as
+        the source of truth, so a key filed under the wrong tenant would keep
+        confirming itself on every subsequent call.
         """
         token_hash = hashlib.sha256(registration_token.encode()).hexdigest()
-        async with self.session_factory() as session:
+        # Resolving a credential is the read that *produces* a tenant, so it
+        # cannot be answered under one: doing so is either a tautology or a
+        # false "invalid token". `key_hash` is one of the two columns
+        # deliberately left globally unique for exactly this, and the
+        # exemption (`db/tenant_lookup.py`) turns it into a tenant id. The key
+        # row itself, and the owner resolution that reads it, are then
+        # ordinary scoped reads under that tenant.
+        tenant_id = await tenant_of_api_key(self.session_factory, token_hash)
+        if tenant_id is None:
+            raise PermissionError("Invalid registration token")
+        async with tenant_session(self.session_factory, tenant_id) as session:
             key = await self.api_key_store.get_by_hash(session, token_hash)
             if key is None or key.type not in REGISTRATION_KEY_TYPES:
                 raise PermissionError("Invalid registration token")
@@ -477,20 +577,22 @@ class ProtocolService:
                     "Agent registration is temporarily unavailable"
                 ) from exc
 
-        return await self.register_agent(
-            name=name,
-            description=description,
-            display_name=display_name,
-            connector_type=connector_type,
-            integration_profile=integration_profile,
-            tools=tools,
-            models=models,
-            metadata=metadata,
-            owner_id=owner_id,
-            overwrite=overwrite,
-            addressable_by_agent_ids=addressable_by_agent_ids,
-            owner_only=owner_only,
-        )
+        with tenant_scope(tenant_id):
+            return await self.register_agent(
+                name=name,
+                description=description,
+                display_name=display_name,
+                connector_type=connector_type,
+                integration_profile=integration_profile,
+                tools=tools,
+                models=models,
+                metadata=metadata,
+                owner_id=owner_id,
+                overwrite=overwrite,
+                addressable_by_agent_ids=addressable_by_agent_ids,
+                owner_only=owner_only,
+                registration_path="bootstrap",
+            )
 
     async def _create_agent(
         self,
@@ -663,9 +765,18 @@ class ProtocolService:
         return existing.id
 
     async def _create_bridge_identities(
-        self, agent_name: str, description: str
+        self, tenant_id: str, agent_name: str, description: str
     ) -> None:
-        for bridge_core in self.collab_lifecycle.all_bridges():
+        """Create `agent_name`'s platform identity on the bridges of
+        `tenant_id` — and only that tenant's bridges.
+
+        The tenant is passed in rather than read from the ambient context so
+        that it is the caller's to establish: `register_agent` refuses without
+        one before it writes anything. Fanning out to every tenant's bridges
+        instead would repeat the cross-tenant identity leak this method exists
+        to avoid.
+        """
+        for bridge_core in self.collab_lifecycle.bridges_for_tenant(tenant_id):
             try:
                 await bridge_core.adapter.create_agent_identity(agent_name, description)
             except Exception:
@@ -767,8 +878,17 @@ class ProtocolService:
             await self.agent_store.update(session, agent_id, icon_url=validated)
             await session.commit()
 
-    async def _remove_bridge_identities(self, agent_name: str) -> None:
-        for bridge_core in self.collab_lifecycle.all_bridges():
+    async def _remove_bridge_identities(self, tenant_id: str, agent_name: str) -> None:
+        """Remove `agent_name`'s platform identity from the bridges of
+        `tenant_id` — and only that tenant's bridges.
+
+        Unscoped, this is worse than its `_create_bridge_identities` twin:
+        deleting an agent in one tenant would delete the platform bot, user
+        group, or role of a same-named agent belonging to another tenant. As
+        there, the tenant is the caller's to establish — `delete_agent`
+        refuses without one before it stops anything.
+        """
+        for bridge_core in self.collab_lifecycle.bridges_for_tenant(tenant_id):
             try:
                 await bridge_core.adapter.remove_agent_identity(agent_name)
             except Exception:
@@ -787,10 +907,23 @@ class ProtocolService:
         """Delete an agent and clean up all associated state.
 
         Provide exactly one of ``agent_id`` or ``agent_name``.
+
+        Raises:
+            ValueError: neither or both selectors were given, or no such agent.
+            RuntimeError: no tenant is bound. Checked before the agent is
+                stopped, so an unbound caller leaves it running rather than
+                half torn down.
         """
         if (agent_id is None) == (agent_name is None):
             raise ValueError(
                 "delete_agent requires exactly one of agent_id or agent_name"
+            )
+
+        tenant_id = current_tenant_id()
+        if tenant_id is None:
+            raise RuntimeError(
+                "delete_agent requires a bound tenant; the agent's row and its "
+                "bridge identities both belong to one"
             )
 
         async with self.session_factory() as session:
@@ -806,10 +939,19 @@ class ProtocolService:
         client_id = agent.client_id
         resolved_id = agent.id
         resolved_name = agent.name
+        # Captured before the row goes: afterwards there is nothing left to
+        # describe what was removed, and "an agent was deleted" without its
+        # runtime or its age says almost nothing.
+        removed: dict[str, str | int | float | bool] = {
+            "known_agent_type": normalise_known_agent_type(agent.metadata_),
+            "age_days": _age_days(agent.created_at),
+            "had_parent": agent.parent_agent_id is not None,
+        }
+        removed["room_count"] = await self._room_count_for(resolved_id)
         await self.client_lifecycle.stop(client_id)
         self.event_buffer.remove(resolved_id)
 
-        await self._remove_bridge_identities(resolved_name)
+        await self._remove_bridge_identities(tenant_id, resolved_name)
 
         async with self.session_factory() as session:
             await self.agent_store.delete(session, resolved_id)
@@ -817,6 +959,29 @@ class ProtocolService:
         self.api_key_cache.invalidate_agent(resolved_id)
 
         await self.client_lifecycle.remove(client_id)
+
+        emit_safely(self.telemetry, "agent_deleted", removed)
+
+    async def _room_count_for(self, agent_id: str) -> int:
+        """How many rooms an agent is in, for reporting only.
+
+        Never raises, and skipped when nothing is listening: this exists to
+        label an analytics event, and deleting an agent must not fail because
+        a count did.
+        """
+        if self.telemetry is None:
+            return 0
+        try:
+            async with self.session_factory() as session:
+                return len(await self.room_store.get_rooms_for_agent(session, agent_id))
+        except Exception:
+            logger.warning(
+                "Could not count rooms for agent %s while reporting its "
+                "deletion; reporting 0.",
+                agent_id,
+                exc_info=True,
+            )
+            return 0
 
     # ── Rooms ──────────────────────────────────────────────────────────────────
 
@@ -1093,6 +1258,10 @@ class ProtocolService:
         """
         if not files:
             raise ValueError("no attachments provided")
+        files = [
+            (data, filename, normalise_mime_type(mimetype))
+            for data, filename, mimetype in files
+        ]
         max_bytes = self.config.agent_media_max_bytes
         for data, filename, _mimetype in files:
             if not data:
@@ -1418,24 +1587,15 @@ class ProtocolService:
         """Record and broadcast an agent's runtime state in a room.
 
         Persists the latest state (so it is queryable via `!status`) and emits
-        a `com.switch.agent.runtime_state` room event the collaboration bridge
-        picks up to surface the state on the bridged channel. Reported by the
-        Switch Console connector as its managed session transitions.
+        a `com.switch.agent.runtime_state` room event for protocol clients that
+        watch it. Reported by the Switch Console connector as its managed
+        session transitions.
 
-        `thread_id` (the triggering message's thread, when it was in one) rides
-        the event so the bridge can surface the state in that thread. It is
-        transient routing only — it is never persisted as part of the state.
-
-        `detail` is a short activity line for the running turn (e.g. "Editing
-        foo.py"); like `thread_id` it is transient and rides the event only —
-        the bridge surfaces it in place on the live working message.
-
-        `anchor_event_id` is the latest message the reporting connector has
-        actually handed to the agent's session. The bridge repositions the
-        indicator when it changes, so position follows what the agent has
-        genuinely been given rather than what merely arrived in the room. Also
-        transient routing — reported on every refresh, and only a change moves
-        anything.
+        What a bridged channel shows of a running turn is the SDK session
+        publication, not this: no collaboration adapter renders the event any
+        more. `thread_id`, `detail` and `anchor_event_id` still ride it as
+        transient routing — never persisted as part of the state — and describe
+        where the turn is happening for a client that wants to draw it.
 
         The `switchdash://` deeplink is rewritten to a gateway HTTP redirect for
         platforms that linkify only http(s) (Discord, Telegram), so the "Open in
@@ -1546,35 +1706,68 @@ class ProtocolService:
         one on the next update, the visible effect was the status message being
         deleted and recreated on every refresh rather than edited in place.
         """
-        async with self.session_factory() as session:
-            rows = await self.agent_runtime_state_store.get_active(session)
+        # This sweep spans every tenant by nature — it is the one place that
+        # decides whether *any* stale row anywhere needs resetting — so it
+        # asks the exemption which tenants there are (`db/tenant_lookup.py`)
+        # and reads each tenant's rows scoped to it. That is one extra round
+        # trip every five seconds, which is what the enumeration costs now
+        # that a single cross-tenant read is not available to it.
+        #
+        # Everything done *with* a row happens inside that row's own tenant,
+        # including the emit at the end: the clear event goes out to a bridge,
+        # which resolves a mention handle and posts a message, and those are
+        # writes in the row's tenant like any other. Closing the binding after
+        # the upsert and leaving the tail outside it would put exactly the
+        # visible half of the work back on whatever was ambient.
+        rows: list[AgentRuntimeState] = []
+        for tenant_id in await all_tenant_ids(self.session_factory):
+            async with tenant_session(self.session_factory, tenant_id) as session:
+                # Filtered on the row's own tenant, not left to the policy: on an
+                # owner connection no policy narrows this read, and the fan-out
+                # would act on every tenant's rows once per tenant. See
+                # `db/tenant_lookup.py`, "a fan-out ... filters what it reads back".
+                rows.extend(
+                    row
+                    for row in await self.agent_runtime_state_store.get_active(session)
+                    if row.tenant_id == tenant_id
+                )
         for row in rows:
             if self.connections.has_session_in(row.agent_id, row.room_id):
                 continue
-            async with self.session_factory() as session:
-                live = await self.agent_session_store.get_live_agent_ids(
-                    session, [row.agent_id], row.room_id
-                )
-            if row.agent_id in live:
-                continue
-            async with self.session_factory() as session:
-                agent = await self.agent_store.get(session, row.agent_id)
-                room = await self.room_store.get(session, row.room_id)
-                if agent is None or room is None:
-                    continue
-                await self.agent_runtime_state_store.upsert(
-                    session, row.agent_id, row.room_id, RUNTIME_STATE_IDLE
-                )
-                await session.commit()
-            await self._emit_runtime_state(
-                agent_id=agent.id,
-                agent_name=agent.name,
-                matrix_room_id=room.matrix_room_id,
-                room_id=room.id,
-                state=RUNTIME_STATE_IDLE,
-                mention_handle=await self._mention_handle_for(agent, room.bridge_id),
-                thread_id=None,
+            with tenant_scope(row.tenant_id):
+                await self._sweep_one_runtime_state(row.agent_id, row.room_id)
+
+    async def _sweep_one_runtime_state(self, agent_id: str, room_id: str) -> None:
+        """One stale row's worth of the sweep, under its tenant.
+
+        Split out so the binding is the whole body rather than a prefix of it:
+        an early `return` here cannot accidentally leave later work outside
+        the scope the way an early `continue` in the loop could.
+        """
+        async with self.session_factory() as session:
+            live = await self.agent_session_store.get_live_agent_ids(
+                session, [agent_id], room_id
             )
+        if agent_id in live:
+            return
+        async with self.session_factory() as session:
+            agent = await self.agent_store.get(session, agent_id)
+            room = await self.room_store.get(session, room_id)
+            if agent is None or room is None:
+                return
+            await self.agent_runtime_state_store.upsert(
+                session, agent_id, room_id, RUNTIME_STATE_IDLE
+            )
+            await session.commit()
+        await self._emit_runtime_state(
+            agent_id=agent.id,
+            agent_name=agent.name,
+            matrix_room_id=room.matrix_room_id,
+            room_id=room.id,
+            state=RUNTIME_STATE_IDLE,
+            mention_handle=await self._mention_handle_for(agent, room.bridge_id),
+            thread_id=None,
+        )
 
     async def _mention_handle_for(
         self, agent: Agent, bridge_id: str | None
@@ -1607,15 +1800,25 @@ class ProtocolService:
 
     @staticmethod
     def _timeline_entry(
-        message: Message, attachments: list[MessageAttachment]
+        message: Message,
+        attachments: list[MessageAttachment],
+        sender_kinds: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Build the agent-facing entry for a recorded row.
 
         An arrival is stored with no body — how it reads is this function's to
         decide, not the writer's — so the sentence is composed here and can be
         changed without rewriting history.
+
+        ``sender_kinds`` is an optional pre-resolved map of sender mxid to
+        kind ("user", "agent", "platform"). When absent, ``sender_kind`` is
+        read from the message content: "platform" for a PLATFORM_MARKER, else
+        None.
         """
         name = message.sender_name or message.sender_id
+        sender_kind = (sender_kinds or {}).get(message.sender_id)
+        if sender_kind is None and _PLATFORM_MARKER in (message.content or {}):
+            sender_kind = "platform"
         if message.event_type == MEMBERSHIP_EVENT_TYPE:
             return {
                 "id": message.transport_event_id,
@@ -1626,7 +1829,7 @@ class ProtocolService:
                 "timestamp": _epoch_ms(message.sent_at),
                 "attachments": [],
             }
-        return {
+        entry: dict[str, Any] = {
             "id": message.transport_event_id,
             "kind": "message",
             "sender": message.sender_id,
@@ -1644,10 +1847,24 @@ class ProtocolService:
                 for attachment in attachments
             ],
         }
+        if sender_kind is not None:
+            entry["sender_kind"] = sender_kind
+        person = platform_on_behalf_of(message.content or {})
+        if person is not None:
+            entry["on_behalf_of"] = person.name
+        return entry
 
     @staticmethod
     def _thread_root_id(message: Message) -> str:
-        """A threaded reply belongs to its root; anything else is its own root."""
+        """A threaded reply belongs to its root; anything else is its own root.
+
+        A platform message flagged reply_in_channel (a template's kickoff
+        text, threaded under its headline only to keep the channel tidy) is
+        read as its own root, so an agent catching up sees the work it starts
+        at the top level and answers there.
+        """
+        if platform_replies_in_channel(message.content or {}):
+            return message.transport_event_id
         return message.thread_root_event_id or message.transport_event_id
 
     async def read_context(
@@ -1670,8 +1887,10 @@ class ProtocolService:
             {"root": <entry>, "replies": [<entry>, ...]}
 
         An <entry> is {"id", "kind", "sender", "sender_name", "body",
-        "timestamp", "attachments"}. `kind` is "message" for something someone
-        said and "room_join" for an arrival. Top-level entries are roots with
+        "timestamp", "attachments"}, plus "sender_kind" ("platform" for a
+        message the Switch app posted) and "on_behalf_of" (the person a
+        platform message spoke for) when they apply. `kind` is "message" for
+        something someone said and "room_join" for an arrival. Top-level entries are roots with
         an empty replies list; replies are ordered oldest-first within a
         thread. A root that falls outside the fetched window but has a reply
         inside it is fetched alongside; if no record of it exists it is
@@ -1778,6 +1997,18 @@ class ProtocolService:
 
     # ── Events ───────────────────────────────────────────────────────────────
 
+    async def _rooms_agent_is_in(self, agent_id: str) -> set[str]:
+        """The rooms the agent is a member of, read fresh.
+
+        Archived rooms included: what this is applied as is membership, and an
+        agent still in an archived room was not removed from it.
+        """
+        async with self.session_factory() as session:
+            rooms = await self.room_store.get_rooms_for_agent(
+                session, agent_id, include_archived=True
+            )
+        return {room.id for room in rooms}
+
     async def poll_events(self, agent_id: str, timeout: float = 10) -> list[AgentEvent]:
         """Poll for events across all rooms the agent is in.
 
@@ -1786,18 +2017,20 @@ class ProtocolService:
         room-scoped sibling `poll_room_events` calls `require_room_member`;
         without the same check this call would hand over events from a room
         the agent has since been removed from.
+
+        A removal already empties the buffer of that room's events (see
+        `AgentClient.on_removed`), so this is the second of two answers rather
+        than the only one. It is kept because it is the authoritative one: the
+        removal signal is in-process, and this is a read of the table the
+        removal wrote.
         """
         async with self.session_factory() as session:
             await self.agent_session_store.touch_heartbeat(session, agent_id, None)
             await session.commit()
-            # Archived rooms included: what is being applied here is
-            # membership, and an agent still in an archived room was not
-            # removed from it.
-            rooms = await self.room_store.get_rooms_for_agent(
-                session, agent_id, include_archived=True
-            )
         return await self.event_buffer.poll(
-            agent_id, timeout=timeout, rooms={room.id for room in rooms}
+            agent_id,
+            timeout=timeout,
+            rooms=lambda: self._rooms_agent_is_in(agent_id),
         )
 
     async def poll_notifications(
@@ -1812,8 +2045,16 @@ class ProtocolService:
         `touch_watch_heartbeat` path, decoupled from this long-poll. Consuming
         this stream never drains the per-room queues, so live session pollers
         are unaffected.
+
+        Membership is applied exactly as it is for `poll_events`, and matters
+        more here: this is the stream carrying the messages addressed at the
+        agent.
         """
-        return await self.event_buffer.poll_notifications(agent_id, timeout=timeout)
+        return await self.event_buffer.poll_notifications(
+            agent_id,
+            timeout=timeout,
+            rooms=lambda: self._rooms_agent_is_in(agent_id),
+        )
 
     async def touch_watch_heartbeat(self, agent_id: str) -> None:
         """Refresh an auto_session connector's global "watching" heartbeat.
@@ -2217,13 +2458,9 @@ class ProtocolService:
         )
 
         async with self.session_factory() as session:
-            agent = await self.agent_store.get(session, agent_id)
-            if agent is None:
-                raise ValueError(f"Unknown agent: {agent_id}")
-            owner_is_admin = False
-            if agent.owner_id is not None:
-                owner = await session.get(User, agent.owner_id)
-                owner_is_admin = owner is not None and owner.role == "admin"
+            agent, _owner_id, owner_is_admin = await self._resolve_acting_identity(
+                session, agent_id
+            )
             group_id = await self._resolve_group_name(session, group_name)
         if (reference_ids or package_ids) and agent.owner_id is None:
             raise ValueError(
@@ -2245,6 +2482,7 @@ class ProtocolService:
             protection_config=security_config,
             instructions=instructions,
             created_by=agent.owner_id,
+            created_by_kind="agent",
             owner_id=agent.owner_id,
             group_id=group_id,
             read_visibility=read_visibility,
@@ -2340,7 +2578,10 @@ class ProtocolService:
                 include_for = [target.id]
         try:
             await self.room_service.add_agents_to_room(
-                room_id, agent_names=[agent_name], include_subagents_for=include_for
+                room_id,
+                agent_names=[agent_name],
+                include_subagents_for=include_for,
+                added_by_kind="agent",
             )
         except ValueError as e:
             raise ValueError(f"Failed to invite agent: {str(e)}") from e
@@ -2365,6 +2606,28 @@ class ProtocolService:
         except ValueError as e:
             raise ValueError(f"Failed to add users: {str(e)}") from e
 
+    def room_yaml_service(self) -> RoomYamlService:
+        """The template engine over this service's collaborators.
+
+        Built here so the gateway's dependency and the agent operation wire
+        it the same way; a collaborator added to ``RoomYamlService`` is then
+        added once.
+        """
+        from switch_core.rooms_yaml import RoomYamlService
+
+        return RoomYamlService(
+            room_service=self.room_service,
+            resource_service=self.resource_service,
+            room_store=self.room_store,
+            agent_store=self.agent_store,
+            bridge_store=self.bridge_store,
+            external_user_store=self.external_user_store,
+            room_role_store=self.room_role_store,
+            session_factory=self.session_factory,
+            room_group_store=self.room_group_store,
+            client_lifecycle=self.client_lifecycle,
+        )
+
     async def _resolve_acting_identity(
         self, session: AsyncSession, agent_id: str
     ) -> tuple[Agent, str | None, bool]:
@@ -2372,6 +2635,13 @@ class ProtocolService:
 
         Returns ``(agent, owner_id, owner_is_admin)``. Used by moderation
         methods that perform resource-access checks on the agent's behalf.
+
+        ``owner_is_admin`` is the owner's tenant-scoped administrative bit
+        (``UserStore.administers``), not the global operator flag alone: the
+        agent must not gain more than its owner holds in the tenant this
+        request is bound to. `session` is already scoped there by the time an
+        agent-bridge request reaches this method, so the read is the owner's
+        membership in the same tenant the agent itself belongs to.
         """
         agent = await self.agent_store.get(session, agent_id)
         if agent is None:
@@ -2379,7 +2649,9 @@ class ProtocolService:
         owner_is_admin = False
         if agent.owner_id is not None:
             owner = await session.get(User, agent.owner_id)
-            owner_is_admin = owner is not None and owner.role == "admin"
+            owner_is_admin = owner is not None and await self.user_store.administers(
+                session, owner
+            )
         return agent, agent.owner_id, owner_is_admin
 
     async def _require_room_action(
@@ -3370,8 +3642,11 @@ class ProtocolService:
         await self.require_room_member(agent_id, room_id)
         async with self.session_factory() as session:
             await self._require_room_action(session, agent_id, room_id, "write")
-            await self.room_store.set_archived(session, room_id, archived)
-            await session.commit()
+        # Through RoomService rather than straight at the store: archiving is
+        # reported, and writing the row here instead would make an agent's
+        # archive the one kind nothing observes while the snapshot's archived
+        # count rose anyway.
+        await self.room_service.set_room_archived(room_id, archived)
         return await self.get_room_detail(agent_id, room_id)
 
     async def list_all_agents(self, agent_id: str) -> list[Agent]:

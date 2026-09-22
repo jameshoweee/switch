@@ -6,7 +6,14 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from switch_core.db.models import OidcIdentity, User
+from switch_core.authz import administers_tenant, owns_tenant
+from switch_core.db.models import (
+    OidcIdentity,
+    TenantMember,
+    User,
+    require_tenant_id,
+)
+from switch_core.tenant_context import current_tenant_id
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +50,81 @@ class OidcIdentityRaceError(Exception):
 
 class UserStore:
     async def create(self, session: AsyncSession, user: User) -> None:
+        """Create the user, and the membership that lets them ever sign in.
+
+        Tenant resolution (`gateway/auth.py`) raises rather than guessing when
+        a user has no membership, so every path that creates a user — this
+        one, reached by the admin "create user" endpoint, JIT OIDC
+        provisioning, and startup admin seeding — must leave exactly one
+        `tenant_members` row behind, or that user's first login cannot be
+        placed in a tenant at all.
+        """
         session.add(user)
         await session.flush()
+        await self.ensure_membership(session, user)
+
+    async def ensure_membership(self, session: AsyncSession, user: User) -> bool:
+        """Give `user` a membership if they have none; leave any they have.
+
+        Returns whether one was written, so a repair path can say it repaired
+        something instead of logging on every boot.
+
+        Called from every path that can produce, or inherit, a user who would
+        otherwise have zero: creation, linking an identity to an account that
+        predates memberships existing, and the startup admin seeding
+        (`main.py`), which reaches accounts none of the others do. Idempotent
+        because most of those run against accounts that already have one, and
+        adding a second would be worse than adding none — resolution refuses
+        to pick between two.
+
+        Public for the sake of that last caller. An account with no membership
+        cannot sign in at all (`gateway/auth.py` answers 403), and until this
+        was reachable from seeding, the only thing that ever repaired one was
+        an OIDC login — so a password-only account in that state had no remedy
+        inside the product and needed direct SQL.
+
+        Joins the tenant bound to the caller's context, so an admin creating a
+        user joins them to their own tenant. There is no fallback: `tenant_id`
+        is not nullable and nothing else in this schema fills it in, so an
+        unbound caller would otherwise get whichever tenant this function
+        happened to name — the same silent write into a real tenant that
+        `require_tenant_id` exists to refuse, and this is the one scoped write
+        the model default cannot cover because `TenantMember` is addressed by
+        its whole primary key. The seeding paths that legitimately run with
+        nothing bound name tenant zero themselves (`main.py`,
+        `gateway/oidc_routes.py`).
+
+        The role mirrors the migration's own mapping for pre-existing users:
+        `owner` for the global admin role, `member` otherwise.
+        """
+        existing = await session.execute(
+            select(TenantMember.tenant_id).where(TenantMember.user_id == user.id)
+        )
+        if existing.first() is not None:
+            return False
+        session.add(
+            TenantMember(
+                tenant_id=require_tenant_id(),
+                user_id=user.id,
+                role="owner" if user.role == "admin" else "member",
+            )
+        )
+        await session.flush()
+        return True
 
     async def get(self, session: AsyncSession, user_id: str) -> User | None:
         return await session.get(User, user_id)
+
+    async def exists(self, session: AsyncSession, user_id: str) -> bool:
+        """Whether this id names a real account, without loading the row.
+
+        Tenant resolution needs the answer on a session it closes immediately
+        (`gateway/auth.py`), and a `User` loaded there would be attached to a
+        session nobody can commit — the exact shape of bug this replaced. It
+        needs no attribute of the row, only that there is one.
+        """
+        result = await session.execute(select(User.id).where(User.id == user_id))
+        return result.first() is not None
 
     async def get_by_email(self, session: AsyncSession, email: str) -> User | None:
         """Case-insensitive: an IdP and a person typing a password don't
@@ -213,7 +290,117 @@ class UserStore:
         logger.warning(
             "Linking OIDC identity (iss=%r, sub=%r) to user %s", iss, sub, user.id
         )
+        # Linking reaches accounts this store did not create, including any
+        # that predate memberships — and an account with none can never sign
+        # in again. The startup admin seeding repairs the deployment's own
+        # admin; this repairs anyone else who signs in through an IdP.
+        await self.ensure_membership(session, user)
 
     async def get_all(self, session: AsyncSession) -> list[User]:
         result = await session.execute(select(User))
         return list(result.scalars().all())
+
+    async def add_membership(
+        self, session: AsyncSession, *, tenant_id: str, user_id: str, role: str
+    ) -> TenantMember:
+        """Insert a `role` membership for `user_id` in `tenant_id`.
+
+        Distinct from `ensure_membership`, which derives the role from the
+        caller's global bit and is a no-op when a membership already exists:
+        this is the explicit write for the two places that grant a *specific*
+        role by a caller's own action — creating a workspace (the creator
+        becomes its `owner`) and accepting an invitation (the invited role).
+        It does not check for an existing row first; a caller that needs that
+        checks before calling. Kept as the one place `TenantMember` is
+        constructed (`tests/switch_core/test_seed_admin_membership.py` pins
+        that), so a route never writes one directly.
+        """
+        membership = TenantMember(tenant_id=tenant_id, user_id=user_id, role=role)
+        session.add(membership)
+        await session.flush()
+        return membership
+
+    async def tenant_role(
+        self, session: AsyncSession, tenant_id: str, user_id: str
+    ) -> str | None:
+        """`user_id`'s membership role in `tenant_id`, or None if not a member.
+
+        `TenantMember` is addressed by its whole primary key, so this is a
+        plain `session.get` rather than a query — same shape as
+        `ensure_membership`'s write.
+        """
+        membership = await session.get(TenantMember, (tenant_id, user_id))
+        return membership.role if membership is not None else None
+
+    async def list_tenant_members(
+        self, session: AsyncSession
+    ) -> list[tuple[User, TenantMember]]:
+        """Every member of the session's bound tenant, joined with their user row.
+
+        No `WHERE tenant_id = …` of its own: the policy on `tenant_members` is
+        what narrows this, the same as `InvitationStore.list_for_tenant`.
+        """
+        result = await session.execute(
+            select(User, TenantMember).join(
+                TenantMember, TenantMember.user_id == User.id
+            )
+        )
+        return [(row[0], row[1]) for row in result.all()]
+
+    async def count_owners(self, session: AsyncSession) -> int:
+        """How many `owner` memberships exist in the session's bound tenant.
+
+        Backs "a workspace must always have an owner": removing or demoting a
+        member is refused when they are the one row this counts.
+        """
+        result = await session.execute(
+            select(func.count())
+            .select_from(TenantMember)
+            .where(TenantMember.role == "owner")
+        )
+        return result.scalar_one()
+
+    async def administers(self, session: AsyncSession, user: User) -> bool:
+        """Whether `user` may administer the tenant bound to `session`'s
+        context — the operator bypass, or an owner/admin membership in it.
+
+        See `authz.administers_tenant`, which this composes with a read of the
+        one membership row that can answer "in *this* tenant".
+
+        Raises:
+            RuntimeError: no tenant is bound. The question has no
+                tenant-independent answer: half of it is a membership row that
+                cannot be read without one. Answering on the operator bit
+                alone would quietly demote a workspace owner to a plain
+                member, and the symptom — a 403 on their own workspace — says
+                nothing about why.
+        """
+        tenant_id = current_tenant_id()
+        if tenant_id is None:
+            raise RuntimeError(
+                "administers requires a bound tenant; whether someone may "
+                "administer a workspace is only answerable about a particular "
+                "one"
+            )
+        role = await self.tenant_role(session, tenant_id, user.id)
+        return administers_tenant(is_operator=user.role == "admin", tenant_role=role)
+
+    async def owns(self, session: AsyncSession, user: User) -> bool:
+        """Whether `user` may decide who owns the tenant bound to `session`'s
+        context — the operator bypass, or an `owner` membership in it.
+
+        The same composition as `administers`, over `authz.owns_tenant`; see
+        there for why the two are separate bits rather than one.
+
+        Raises:
+            RuntimeError: no tenant is bound, for the same reason
+                `administers` raises.
+        """
+        tenant_id = current_tenant_id()
+        if tenant_id is None:
+            raise RuntimeError(
+                "owns requires a bound tenant; whether someone owns a "
+                "workspace is only answerable about a particular one"
+            )
+        role = await self.tenant_role(session, tenant_id, user.id)
+        return owns_tenant(is_operator=user.role == "admin", tenant_role=role)

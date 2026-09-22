@@ -1,8 +1,4 @@
 import { eq } from 'drizzle-orm';
-import {
-  agentSidecarTmuxName,
-  killSidecarSession,
-} from '@main/core/agent-runtime/impl/remote-sidecar-launcher';
 import { getPlugin } from '@main/core/providers/plugin-registry';
 import { sessionHooks } from '@main/core/sessions/session-hooks';
 import { setAutoSessionAgent } from '@main/core/switch-rooms/auto-session-store';
@@ -30,11 +26,11 @@ import { sessionRuntimeManager } from '../sessions/session-runtime-manager';
 import { agentEvents } from './agent-events';
 import { getAgentLocation } from './agent-location';
 import { resolveWorkspaceFsFor } from './agent-workspace-fs';
-import { connectRemoteAgent } from './connect-remote-agent';
 import { getAgentById } from './getAgentById';
 import { stopRemoteWatcher } from './remote-watcher';
 import { removeAgentLaunchProfile } from './remove-launch-profile';
 import { removeSwitchCredentials } from './remove-switch-settings';
+import { stopSharedAgentSessions } from './stop-shared-agent-sessions';
 import { agentSettingsRelativePath } from './switch-settings-paths';
 
 export type DeleteAgentOptions = {
@@ -44,6 +40,19 @@ export type DeleteAgentOptions = {
    * left registered on the server.
    */
   deleteInSwitch: boolean;
+  /**
+   * Also tear down what was provisioned on disk for this agent (its
+   * `.switch/agents/<name>.json` credentials, provider definition files, launch
+   * profile) and kill its sidecar on the host.
+   *
+   * Required with no default, because the right answer depends on who owns the
+   * on-disk state: an agent this Console created can carry its files out, but an
+   * agent merely loaded from a shared host (CHOO-2560) has credentials that
+   * belong to ANOTHER install — deleting them there is data loss on a
+   * colleague's machine. Plain remove must mirror attach's guarantee: nothing in
+   * the working directory is touched.
+   */
+  removeProvisionedFiles: boolean;
   /**
    * Whether a person removed this agent or a server teardown swept it up.
    *
@@ -150,32 +159,6 @@ async function removeProvisionedFiles(agent: Agent, location: Location): Promise
 }
 
 /**
- * Kill the agent's own sidecar on its VM. `stopRemoteWatcher` only flips the
- * watch flag — the process stays up, holding this agent's Switch room
- * connections and renewing them, for an agent that is about to stop existing.
- * Nothing would ever address that sidecar again: its tmux name is derived from
- * the agent row being deleted. Scoped to this agent's name, so a sibling sharing
- * the directory keeps its own (CHOO-1440).
- *
- * Best-effort: an unreachable host must not block removing the agent locally.
- */
-async function killRemoteSidecar(agent: Agent): Promise<void> {
-  try {
-    const { host, remoteRepoDir } = await connectRemoteAgent(agent);
-    await killSidecarSession(
-      host,
-      agentSidecarTmuxName(remoteRepoDir, agent.name ?? agent.id),
-      log
-    );
-  } catch (error) {
-    log.warn('deleteAgent: failed to kill the remote sidecar', {
-      agentId: agent.id,
-      error: String(error),
-    });
-  }
-}
-
-/**
  * Delete an agent — the one real delete entry point (the sidebar's Remove
  * Agent routes here). Tears down everything a bare row delete would leak:
  *
@@ -188,9 +171,11 @@ async function killRemoteSidecar(agent: Agent): Promise<void> {
  *    caches the agent's Switch credentials in memory, so without an explicit
  *    stop it keeps heartbeating and polling notifications for an agent that
  *    no longer exists.
- * 4. The Switch credentials + definition file Switch Console provisioned on disk for
- *    THIS agent (local or remote), which a bare row delete would leave orphaned.
- *    Sibling agents' files in the same directory are untouched.
+ * 4. Only when `removeProvisionedFiles` is set: the Switch credentials +
+ *    definition file provisioned on disk for THIS agent (local or remote), and
+ *    its sidecar. A plain remove leaves the working directory and the host's
+ *    processes untouched — on a shared host they may belong to another install
+ *    (CHOO-2560). Sibling agents' files are never touched either way.
  *
  * The agent's location row is intentionally kept — locations are reusable
  * and other agents may still live there.
@@ -226,6 +211,12 @@ async function removeAgent(
   location: Location | null,
   options: DeleteAgentOptions
 ): Promise<void> {
+  const terminate = options.removeProvisionedFiles || options.deleteInSwitch;
+  if (terminate && agent) {
+    if (location?.sshHost) await stopRemoteWatcher(agentId);
+    else await autoSessionWatcher.stopForAgent(agentId);
+    await stopSharedAgentSessions(agent);
+  }
   // Gateway cascade first: fail loud before touching local state so a failure
   // never leaves the row deleted but the Switch identity orphaned.
   if (options.deleteInSwitch && agent) {
@@ -236,25 +227,28 @@ async function removeAgent(
     .select({ id: sessions.id })
     .from(sessions)
     .where(eq(sessions.agentId, agentId));
-  await Promise.allSettled(
-    sessionRows.flatMap((row) => [
-      sessionRuntimeManager.teardownSession(row.id),
-      viewStateService.del(`session:${row.id}`),
-    ])
+  await Promise.all(
+    sessionRows.map(async (row) => {
+      const result = await sessionRuntimeManager.teardownSession(
+        row.id,
+        terminate ? 'terminate' : 'detach'
+      );
+      if (!result.success) throw new Error('Session cleanup failed; agent removal was cancelled.');
+      await viewStateService.del(`session:${row.id}`);
+    })
   );
 
   if (location && location.sshHost !== null) {
     await stopRemoteWatcher(agentId).catch((error) => {
       log.warn('deleteAgent: failed to stop remote watcher', { agentId, error: String(error) });
     });
-    if (agent) await killRemoteSidecar(agent);
   } else {
-    autoSessionWatcher.stopForAgent(agentId);
+    await autoSessionWatcher.stopForAgent(agentId);
   }
 
   await setAutoSessionAgent(agentId, false);
 
-  if (agent && location) {
+  if (agent && location && options.removeProvisionedFiles) {
     await removeProvisionedFiles(agent, location).catch((error) => {
       log.warn('deleteAgent: failed to remove provisioned files', {
         agentId,

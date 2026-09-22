@@ -11,9 +11,13 @@ import {
   readAgentAdvancedConfig,
   updateAgentAdvancedConfig,
 } from './agent-advanced-config';
-import { readAgentInstructions, setAgentInstructions } from './agent-config';
+import {
+  readAgentInstructions,
+  readAgentTemplateOrigin,
+  setAgentInstructions,
+} from './agent-config';
 import { readAgentDefinition, updateAgentDefinition } from './agent-definition';
-import { getAgentModelCatalogue } from './agent-model-catalogue';
+import { getAgentModelCatalogue, getProviderReadiness } from './agent-model-catalogue';
 import { assignAgentServer } from './assignAgentServer';
 import {
   attachConfiguredAgents,
@@ -23,11 +27,18 @@ import { createAgent } from './createAgent';
 import { getAgentDefinitionFields } from './definition-fields';
 import { deleteAgent, type DeleteAgentOptions } from './deleteAgent';
 import { discoverConfiguredAgents } from './discover-configured-agents';
+import {
+  discoverLoadableAgentsInDir,
+  discoverLoadableAgentsOnHost,
+  type DiscoverLoadableAgentsParams,
+} from './discover-loadable-agents';
 import { discoverLocationAgents } from './discover-location-agents';
 import { getAgentById } from './getAgentById';
 import { getAgents } from './getAgents';
 import { onboardAgent } from './onboard-agent';
 import { onboardLocationAgents, type OnboardLocationParams } from './onboard-location-agents';
+import type { RemoveLoadableAgentConfigParams } from './remove-loadable-agent-config';
+import { removeLoadableAgentConfig } from './remove-loadable-agent-config';
 import { renameAgent } from './renameAgent';
 import { resetRemoteAgent } from './reset-remote-agent';
 import { setAgentAutoApprove, type AgentAutoApproveParams } from './setAgentAutoApprove';
@@ -61,6 +72,11 @@ export const agentsController = createRPCController({
    * fields that declare a catalogue binding. Reports why it could not be read
    * rather than throwing: the form degrades to plain text and says so.
    */
+  providerReadiness: (params: {
+    providerId: AgentProviderId;
+    sshHost: string | null;
+    dir: string;
+  }) => getProviderReadiness(params, false),
   modelCatalogue: (params: { providerId: AgentProviderId; sshHost: string | null; dir: string }) =>
     getAgentModelCatalogue(params),
   /**
@@ -70,6 +86,7 @@ export const agentsController = createRPCController({
    * the agent rather than one of its provider's settings.
    */
   readInstructions: (params: { agentId: string }) => readAgentInstructions(params.agentId),
+  readTemplateOrigin: (params: { agentId: string }) => readAgentTemplateOrigin(params.agentId),
   updateInstructions: (params: { agentId: string; instructions: string }): Promise<void> =>
     setAgentInstructions(params).then(() => undefined),
   readAdvancedConfig: (params: { agentId: string }) => readAgentAdvancedConfig(params.agentId),
@@ -85,13 +102,20 @@ export const agentsController = createRPCController({
   }) => discoverLocationAgents(params),
   discoverConfiguredAgents: (params: { sshHost: string | null; dir: string; serverId: string }) =>
     discoverConfiguredAgents(params),
+  discoverLoadableAgentsOnHost: (params: DiscoverLoadableAgentsParams) =>
+    discoverLoadableAgentsOnHost(params),
+  discoverLoadableAgentsInDir: (params: { sshHost: string; dir: string; serverId: string }) =>
+    discoverLoadableAgentsInDir(params),
   attachConfiguredAgents: (params: AttachConfiguredAgentsParams) => attachConfiguredAgents(params),
+  removeLoadableAgentConfig: (params: RemoveLoadableAgentConfigParams) =>
+    removeLoadableAgentConfig(params),
   getAgents: (locationId?: string) => getAgents(locationId),
   getAgentById: (agentId: string) => getAgentById(agentId),
   renameAgent: (params: RenameAgentParams) => renameAgent(params),
   deleteAgent: (params: { agentId: string } & DeleteAgentOptions) =>
     deleteAgent(params.agentId, {
       deleteInSwitch: params.deleteInSwitch,
+      removeProvisionedFiles: params.removeProvisionedFiles,
       trigger: params.trigger,
     }),
   resetRemoteAgent: (params: { agentId: string }) => resetRemoteAgent(params.agentId),

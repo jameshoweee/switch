@@ -4,8 +4,10 @@ import asyncio
 import logging
 import re
 import uuid
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar, cast, get_args
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -13,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from switch_core.aliases import AliasError, validate_alias_format
 from switch_core.attachments import parse_attachment_group
 from switch_core.bridges.collaboration.adapter import (
+    ActivitySnapshot,
     AgentPresentation,
     CollaborationAdapter,
 )
@@ -21,22 +24,53 @@ from switch_core.bridges.collaboration.models import (
     InboundAgentJoin,
     InboundAppJoin,
     InboundCommand,
+    InboundInteraction,
     InboundMessage,
     InboundUserJoin,
     OutboundAttachment,
 )
-from switch_core.clients.admin_messages import ADMIN_MARKER, AdminMessageType
+from switch_core.bridges.collaboration.session.activity_journal import ActivityJournal
+from switch_core.bridges.collaboration.session.demo import SessionDemo
+from switch_core.bridges.collaboration.session.inbound import (
+    InboundActor,
+    Refused,
+    SessionInteractions,
+    interrupt_command,
+)
+from switch_core.bridges.collaboration.session.outbound import (
+    SessionRequestCards,
+    SessionTurnActivity,
+)
+from switch_core.bridges.collaboration.session.renderers import INTERRUPT_ACTION
+from switch_core.clients.admin_messages import (
+    ADMIN_MARKER,
+    PLATFORM_MARKER,
+    AdminMessageType,
+    platform_on_behalf_of,
+)
 from switch_core.clients.client_base import ClientBase, ClientConfig
 from switch_core.clients.mentions import mention_regex, strip_emphasis
 from switch_core.db.models import BridgeMessageMap, ExternalUser
+from switch_core.db.session_scope import tenant_session
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.bridge_message_map_store import BridgeMessageMapStore
 from switch_core.db.stores.client_store import ClientStore
 from switch_core.db.stores.external_user_store import ExternalUserStore
 from switch_core.db.stores.room_store import RoomStore
-from switch_core.events import AgentRuntimeStateEvent
+from switch_core.db.stores.session_request_post_store import SessionRequestPostStore
+from switch_core.db.tenant_lookup import tenant_of_room
+from switch_core.logging_context import log_context
+from switch_core.observability.catalogue import (
+    BRIDGE_ERRORS,
+    BRIDGE_EVENTS_IN,
+    BRIDGE_EVENTS_OUT,
+)
+from switch_core.observability.metrics import metrics
 from switch_core.provisioning import Provisioning
 from switch_core.room_service import RoomCreateConfig
+from switch_core.sessions.attachments import normalise_mime_type
+from switch_core.sessions.contract import Command, Origin, Surface
+from switch_core.tenant_context import no_tenant, tenant_scope
 from switch_core.transport import (
     InboundMedia as TransportMedia,
 )
@@ -52,7 +86,20 @@ if TYPE_CHECKING:
     from switch_core.clients.client_lifecycle_service import ClientLifecycleService
     from switch_core.room_service import RoomService
 
+from switch_core.sessions.publication import ActivityControlTarget, SessionPublisher
+from switch_core.sessions.service import SessionAuthority, SessionError
+
 logger = logging.getLogger(__name__)
+
+_InboundEventT = TypeVar(
+    "_InboundEventT",
+    InboundInteraction,
+    InboundMessage,
+    InboundCommand,
+    InboundAgentJoin,
+    InboundUserJoin,
+    InboundAppJoin,
+)
 
 # How long to wait for a freshly-invited external-user puppet to actually join a
 # room before giving up on relaying its message.
@@ -61,6 +108,11 @@ PUPPET_JOIN_TIMEOUT = 30.0
 # How long to hold an incomplete outbound attachment group before relaying the
 # parts that arrived, flagged as incomplete (see _schedule_outbound_group_flush).
 OUTBOUND_GROUP_TIMEOUT_SECONDS = 5.0
+
+
+def _is_thread_reply(content: Mapping[str, object]) -> bool:
+    relates = content.get("m.relates_to")
+    return isinstance(relates, dict) and relates.get("rel_type") == "m.thread"
 
 
 @dataclass
@@ -72,11 +124,6 @@ class _PendingOutboundGroup:
     caption: str | None = None
     first_event_id: str | None = None
 
-
-# How long a queued runtime-indicator move waits before it runs, so a burst of
-# messages to the same agent costs one move rather than one per message. Short
-# enough that the indicator still reads as following the conversation.
-_INDICATOR_MOVE_DELAY_SECONDS = 1.0
 
 _LOBBY_DEPRECATION_NOTICE = (
     "👋 This isn't where you talk to agents — direct messages to the Switch "
@@ -109,12 +156,14 @@ class BridgeCore:
         self,
         *,
         bridge_id: str,
+        bridge_tenant_id: str,
         bridge_type: str,
         bridge_display_name: str,
         adapter: CollaborationAdapter,
         room_store: RoomStore,
         external_user_store: ExternalUserStore,
         bridge_message_map_store: BridgeMessageMapStore,
+        session_request_post_store: SessionRequestPostStore,
         agent_store: AgentStore,
         client_store: ClientStore,
         room_service: RoomService,
@@ -124,8 +173,18 @@ class BridgeCore:
         matrix_server_name: str,
         bridge_client_matrix_user_id: str,
         max_attachment_bytes: int,
+        session_demo_enabled: bool,
+        gateway_public_url: str | None = None,
     ) -> None:
         self._bridge_id = bridge_id
+        # The tenant of this bridge's own row. Read once here because it is
+        # immutable, but never *bound* for the life of anything: each unit of
+        # work binds it at the point it acts, and room-scoped work binds the
+        # room's tenant instead. The schema makes those the same value —
+        # `rooms` has a composite foreign key to `collaboration_bridges` on
+        # `tenant_id` — but the code does not lean on that, so a room whose
+        # tenant somehow differs is still handled under its own.
+        self._bridge_tenant_id = bridge_tenant_id
         self._bridge_type = bridge_type
         self._bridge_display_name = bridge_display_name
         self._adapter = adapter
@@ -144,6 +203,11 @@ class BridgeCore:
 
         self._channel_to_room: dict[str, tuple[str, str]] = {}
         self._room_to_channel: dict[tuple[str, str], str] = {}
+        # Switch room id -> its tenant. Filled by `add_room_mapping`, which is
+        # the one way a room enters the channel maps at all, so a room that
+        # has a channel mapping always has a tenant here — including rooms
+        # created long after this bridge started. See `_room_tenant`.
+        self._room_tenants: dict[str, str] = {}
         self._user_puppets: dict[str, str] = {}
         # External user ids whose stored name is known not to be a platform id,
         # so the placeholder repair does not re-ask the database once per
@@ -165,14 +229,6 @@ class BridgeCore:
         # never completes cannot leak.
         self._outbound_groups: dict[str, _PendingOutboundGroup] = {}
         self._outbound_group_timers: dict[str, asyncio.TimerHandle] = {}
-        # (channel_id, agent_name) whose runtime indicator is due to be moved
-        # below newly-arrived traffic, and the thread each should land in.
-        # See _schedule_indicator_move.
-        self._indicator_move_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
-        self._indicator_move_targets: dict[tuple[str, str], str | None] = {}
-        # (channel_id, agent_name) -> the last message the agent reported having
-        # been handed. Cleared when its turn ends. See _follow_reported_anchor.
-        self._reported_anchors: dict[tuple[str, str], str] = {}
         # Matrix-event -> external-post anchors written synchronously right after
         # room_send, before the durable _record_message_map commit, so a fast
         # command reply relayed during that DB await still resolves the command's
@@ -181,24 +237,210 @@ class BridgeCore:
         self._pending_message_maps: dict[str, str] = {}
         # Identity provisioning runs in the background — see _create_agent_identities.
         self._identity_task: asyncio.Task[None] | None = None
+        # Answers to a session's requests, coming back off the platform's own
+        # controls. Absent on a platform the session contract has no surface
+        # name for, because an answer must record where it was given.
+        self._session_authority = SessionAuthority(session_factory)
+        self._session_publication_task: asyncio.Task[None] | None = None
+        self._session_cards = (
+            SessionRequestCards(
+                adapter,
+                bridge_id=bridge_id,
+                surface=bridge_type,
+                posts=session_request_post_store,
+                session_factory=session_factory,
+            )
+            if adapter.publishes_sdk_sessions
+            else None
+        )
+        self._session_activity = (
+            SessionTurnActivity(
+                adapter, journal=ActivityJournal(session_factory, bridge_id)
+            )
+            if adapter.publishes_sdk_sessions
+            else None
+        )
+        self._session_publisher = (
+            SessionPublisher(
+                session_factory,
+                bridge_id,
+                self._session_cards,
+                self._session_activity,
+                gateway_public_url=gateway_public_url,
+            )
+            if self._session_cards is not None
+            else None
+        )
+        self._session_interactions = self._build_session_interactions(
+            session_request_post_store
+        )
+        # A recorded session, posting a real card into a real channel, so the
+        # answer path above has something to resolve against before any host
+        # can speak the contract. Absent unless asked for. See session/demo.py.
+        self._session_demo = self._build_session_demo(
+            session_request_post_store, enabled=session_demo_enabled
+        )
+
+    def _build_session_demo(
+        self, posts: SessionRequestPostStore, *, enabled: bool
+    ) -> SessionDemo | None:
+        if not enabled:
+            return None
+        if not self._adapter.publishes_sdk_sessions:
+            logger.warning(
+                "SESSION_DEMO_ENABLED is set, but %s posts no request cards, so "
+                "the demo trigger does nothing on this bridge",
+                self._bridge_type,
+            )
+            return None
+        return SessionDemo(
+            SessionRequestCards(
+                self._adapter,
+                bridge_id=self._bridge_id,
+                surface=self._bridge_type,
+                posts=posts,
+                session_factory=self._session_factory,
+            ),
+            SessionTurnActivity(self._adapter),
+        )
+
+    def _build_session_interactions(
+        self, posts: SessionRequestPostStore
+    ) -> SessionInteractions | None:
+        if self._bridge_type not in get_args(Surface):
+            logger.warning(
+                "Bridge type %s is not a session contract surface, so answers "
+                "given on it cannot be attributed and its controls stay inert",
+                self._bridge_type,
+            )
+            return None
+        return SessionInteractions(
+            bridge_id=self._bridge_id,
+            surface=cast(Surface, self._bridge_type),
+            posts=posts,
+            session_factory=self._session_factory,
+            identify=self._identify_actor,
+            is_first_reply=self._adapter.is_first_reply,
+        )
 
     @property
     def adapter(self) -> CollaborationAdapter:
         return self._adapter
+
+    @property
+    def tenant_id(self) -> str:
+        return self._bridge_tenant_id
+
+    @property
+    def bridge_type(self) -> str:
+        """The collaboration platform this bridge talks to."""
+        return self._bridge_type
+
+    @contextmanager
+    def _counted_outbound(self, kind: str) -> Iterator[None]:
+        """Count one relay out to the platform, and its failure if it fails.
+
+        Placed around the relay call rather than at the top of the handler: a
+        handler returns early for a puppet's own echo and for a room with no
+        channel mapping, and neither of those is a message anybody sent
+        outwards.
+        """
+        metrics().increment(
+            BRIDGE_EVENTS_OUT, {"platform": self._bridge_type, "kind": kind}
+        )
+        try:
+            yield
+        except Exception:
+            metrics().increment(
+                BRIDGE_ERRORS, {"platform": self._bridge_type, "direction": "outbound"}
+            )
+            raise
+
+    def _traced(
+        self, kind: str, handler: Callable[[_InboundEventT], Awaitable[None]]
+    ) -> Callable[[_InboundEventT], Awaitable[None]]:
+        """Give each inbound platform event its own id in the logs, count it,
+        and bind the tenant the event belongs to.
+
+        An event fans out across room lookup, identity provisioning and the
+        transport, so without this the lines from two events arriving at once
+        cannot be told apart. Applied where the adapter is wired up rather than
+        inside each handler, so every inbound path gets it — and the same
+        choke point is where the tenant is bound, so a handler needs no
+        session-opening call site of its own to remember it.
+
+        This is what makes the platform irrelevant. An adapter is free to
+        deliver from anywhere: Mattermost's websocket runs on an OS thread and
+        hands the coroutine over with `asyncio.run_coroutine_threadsafe`,
+        which starts it in an *empty* context, while Slack's dispatches from a
+        task that inherited whatever created it. Binding here rather than
+        relying on what the handler inherits means both arrive at the same
+        tenant, so which platform a message came in on stops being able to
+        decide where its room lands.
+
+        A channel with no room yet — auto-room-creation, still to come in the
+        handler — binds the **bridge's** tenant. There is no room to ask, but
+        there is nothing ambient about the answer either: a room this bridge
+        creates belongs to the tenant that owns the bridge, and the schema
+        agrees (`rooms` keys to `collaboration_bridges` on `tenant_id`).
+        """
+
+        async def traced(event: _InboundEventT) -> None:
+            event_id = uuid.uuid4().hex[:16]
+            with log_context(request_id=f"{self._bridge_type}-{event_id}"):
+                metrics().increment(
+                    BRIDGE_EVENTS_IN, {"platform": self._bridge_type, "event": kind}
+                )
+                room_ids = self._channel_to_room.get(event.channel_id)
+                tenant_id = (
+                    self._bridge_tenant_id
+                    if room_ids is None
+                    else await self._room_tenant(room_ids[0])
+                )
+                with tenant_scope(tenant_id):
+                    try:
+                        await handler(event)
+                    except Exception:
+                        # Counted here and re-raised unchanged: whoever handles
+                        # it above still does. An inbound handler that fails is
+                        # a message a person sent and nobody received, which is
+                        # invisible from the platform's side.
+                        metrics().increment(
+                            BRIDGE_ERRORS,
+                            {"platform": self._bridge_type, "direction": "inbound"},
+                        )
+                        raise
+
+        return traced
 
     async def start(self) -> None:
         await self._load_channel_map()
         await self._load_existing_puppets()
         self._adapter.set_channel_migration_handler(self._handle_channel_migrated)
         self._adapter.set_agent_presentation_resolver(self._agent_presentation)
+        if self._session_interactions is not None:
+            self._adapter.set_interaction_handler(
+                self._traced("interaction", self._handle_inbound_interaction)
+            )
+        if self._session_publisher is not None:
+            self._adapter.set_activity_resolver(self._activity_shown_at)
         await self._adapter.start(
-            on_message=self._handle_inbound_message,
-            on_command=self._handle_inbound_command,
-            on_agent_joined=self._handle_agent_joined_channel,
-            on_user_joined=self._handle_user_joined_channel,
-            on_app_joined=self._handle_app_joined_channel,
+            on_message=self._traced("message", self._handle_inbound_message),
+            on_command=self._traced("command", self._handle_inbound_command),
+            on_agent_joined=self._traced(
+                "agent_joined", self._handle_agent_joined_channel
+            ),
+            on_user_joined=self._traced(
+                "user_joined", self._handle_user_joined_channel
+            ),
+            on_app_joined=self._traced("app_joined", self._handle_app_joined_channel),
         )
         await self._ensure_channel_captures()
+        if self._session_publisher is not None:
+            with tenant_scope(self._bridge_tenant_id):
+                self._session_publication_task = asyncio.create_task(
+                    self._session_publisher.run()
+                )
         # Deliberately not awaited. Provisioning is one call per agent against
         # the platform, and a rate-limited platform makes that minutes of
         # mostly waiting — which would hold up the bridge coming online, and
@@ -208,6 +450,13 @@ class BridgeCore:
         self._identity_task = asyncio.create_task(self._run_agent_identities())
 
     async def stop(self) -> None:
+        if self._session_publication_task is not None:
+            self._session_publication_task.cancel()
+            try:
+                await self._session_publication_task
+            except asyncio.CancelledError:
+                pass
+            self._session_publication_task = None
         if self._identity_task and not self._identity_task.done():
             self._identity_task.cancel()
         self._identity_task = None
@@ -216,16 +465,53 @@ class BridgeCore:
     # ── Startup loading ──────────────────────────────────────────────────────
 
     async def _load_channel_map(self) -> None:
-        async with self._session_factory() as session:
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
             rooms = await self._room_store.get_by_bridge(session, self._bridge_id)
         for room in rooms:
             if room.external_channel_id:
-                key = (room.id, room.matrix_room_id)
-                self._channel_to_room[room.external_channel_id] = key
-                self._room_to_channel[key] = room.external_channel_id
+                self.add_room_mapping(
+                    room.id,
+                    room.matrix_room_id,
+                    room.external_channel_id,
+                    room.tenant_id,
+                )
+
+    async def _room_tenant(self, room_id: str) -> str:
+        """The tenant `room_id` belongs to, resolved and cached.
+
+        Cached by room id rather than assumed to be this bridge's own tenant:
+        nothing here relies on a bridge never carrying rooms in more than one
+        tenant, only on a given room's tenant never changing once it exists —
+        the same invariant `_channel_to_room` already relies on for the
+        channel mapping.
+
+        A miss should not happen — `add_room_mapping` fills the tenant along
+        with the channel mapping, and this is only ever asked about a room
+        that has one — but if it does, the answer comes from the exemption
+        (`db/tenant_lookup.py`) rather than from a read of the row. Asking
+        "which tenant is this room in" while a tenant is bound would either
+        confirm the guess or return nothing, and the second reads as "no such
+        room" for a room that exists in another tenant. The whole point of
+        resolving is that the answer is not known yet.
+
+        This is the shape the exemption is for. The fallback needed one field
+        of one row, and the field was the tenant; it now reads no row at all.
+        """
+        cached = self._room_tenants.get(room_id)
+        if cached is not None:
+            return cached
+        tenant_id = await tenant_of_room(self._session_factory, room_id)
+        if tenant_id is None:
+            raise ValueError(f"Room not found: {room_id}")
+        self._room_tenants[room_id] = tenant_id
+        return tenant_id
 
     async def _load_existing_puppets(self) -> None:
-        async with self._session_factory() as session:
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
             users = await self._external_user_store.get_by_bridge(
                 session, self._bridge_id
             )
@@ -255,7 +541,15 @@ class BridgeCore:
 
         A bare create_task swallows whatever the coroutine raises, so anything
         escaping the per-agent handling below would vanish without trace.
-        Cancellation is ordinary shutdown and says so quietly."""
+        Cancellation is ordinary shutdown and says so quietly.
+
+        `no_tenant` for the same reason the bridge's own task does it: this is
+        a task, and a task keeps whatever context created it. The work inside
+        binds the bridge's tenant for itself."""
+        with no_tenant():
+            await self._run_agent_identities_unbound()
+
+    async def _run_agent_identities_unbound(self) -> None:
         try:
             await self._create_agent_identities()
         except asyncio.CancelledError:
@@ -270,7 +564,9 @@ class BridgeCore:
             )
 
     async def _create_agent_identities(self) -> None:
-        async with self._session_factory() as session:
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
             agents = await self._agent_store.get_all(session)
 
         failed = 0
@@ -309,7 +605,9 @@ class BridgeCore:
         bridge's channels. Runs on startup so capture self-heals after a restart
         or a notification-URL change (e.g. a rotated tunnel). A no-op for
         adapters that don't use expiring subscriptions."""
-        async with self._session_factory() as session:
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
             rooms = await self._room_store.get_by_bridge(session, self._bridge_id)
         channels: list[tuple[str, str]] = []
         for room in rooms:
@@ -329,8 +627,16 @@ class BridgeCore:
         know whether to override what it already has. Either field being None
         within a hit means the same thing one field down: the agent was given
         no value, and the adapter's default stands.
+
+        Installed on the adapter, so it is called from the adapter's own task
+        with nothing bound rather than through `_traced` — hence the explicit
+        bind. Agent names are unique per tenant, not globally, so an unscoped
+        read here would raise `MultipleResultsFound` the day a second tenant
+        has an agent of the same name.
         """
-        async with self._session_factory() as session:
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
             agent = await self._agent_store.get_by_name(session, agent_name)
         if agent is None:
             return None
@@ -459,6 +765,10 @@ class BridgeCore:
             # and routing the message. Only Slack im/mpim map to "lobby".
             await self._handle_lobby_message(msg)
             return
+        # An answer typed in words. Almost no message is one, and the check is a
+        # parse before it is a query, so this costs a channel nothing. It does
+        # not consume the message: the room still sees what was said.
+        await self._handle_text_answer(msg)
         room_ids = self._channel_to_room.get(msg.channel_id)
         if room_ids is None:
             lock = self._channel_locks.setdefault(msg.channel_id, asyncio.Lock())
@@ -623,6 +933,9 @@ class BridgeCore:
                 return
         room_id, matrix_room_id = room_ids
 
+        if await self._handle_session_demo(cmd, room_id):
+            return
+
         puppet = await self._ensure_user_in_matrix_room(
             external_user_id=cmd.sender_id,
             external_username=cmd.sender_name,
@@ -716,7 +1029,7 @@ class BridgeCore:
             logger.debug("Room already exist, add %s to channel", join.agent_name)
             room_id, _ = existing
             await self._room_service.add_agents_to_room(
-                room_id, agent_names=[join.agent_name]
+                room_id, agent_names=[join.agent_name], added_by_kind="system"
             )
             return
 
@@ -755,7 +1068,12 @@ class BridgeCore:
         """
         lock = self._channel_locks.setdefault(old_id, asyncio.Lock())
         async with lock:
-            async with self._session_factory() as session:
+            # Reached from the adapter's own task rather than through
+            # `_traced`, so nothing is bound: this is one unit of work for one
+            # bridge, and it binds that bridge's tenant to find its room.
+            async with tenant_session(
+                self._session_factory, self._bridge_tenant_id
+            ) as session:
                 room = await self._room_store.get_by_external_channel(
                     session, self._bridge_id, old_id
                 )
@@ -784,13 +1102,12 @@ class BridgeCore:
                         room.id,
                     )
                     return
+            async with tenant_session(self._session_factory, room.tenant_id) as session:
                 await self._room_store.update_external_channel(session, room.id, new_id)
                 await session.commit()
 
-            key = (room.id, room.matrix_room_id)
             self._channel_to_room.pop(old_id, None)
-            self._channel_to_room[new_id] = key
-            self._room_to_channel[key] = new_id
+            self.add_room_mapping(room.id, room.matrix_room_id, new_id, room.tenant_id)
             logger.warning(
                 "Re-pointed room %s from channel %s to %s after the platform "
                 "reissued the id",
@@ -811,13 +1128,15 @@ class BridgeCore:
         """If a room already exists in the DB for this channel on this bridge,
         register it in the in-memory map and return its (room_id,
         matrix_room_id). Returns None if no such room exists. Idempotent."""
-        async with self._session_factory() as session:
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
             room = await self._room_store.get_by_external_channel(
                 session, self._bridge_id, channel_id
             )
         if room is None:
             return None
-        self.add_room_mapping(room.id, room.matrix_room_id, channel_id)
+        self.add_room_mapping(room.id, room.matrix_room_id, channel_id, room.tenant_id)
         logger.debug("Adopted existing room %s for channel %s", room.id, channel_id)
         return (room.id, room.matrix_room_id)
 
@@ -868,6 +1187,9 @@ class BridgeCore:
             channel_type=channel_type,
             bridge_id=self._bridge_id,
             external_channel_id=channel_id,
+            # Adopted from a channel that appeared on the platform, not asked
+            # for by anyone in Switch.
+            created_by_kind="system",
         )
 
         try:
@@ -893,7 +1215,7 @@ class BridgeCore:
             return None
         room = result.room
 
-        self.add_room_mapping(room.id, room.matrix_room_id, channel_id)
+        self.add_room_mapping(room.id, room.matrix_room_id, channel_id, room.tenant_id)
         logger.info(
             "Auto-created %s room %s for %s channel %s",
             channel_type,
@@ -942,6 +1264,12 @@ class BridgeCore:
         Only resolvable names appear in the returned dict; names with no
         matching external user on this bridge are omitted (and logged), so the
         caller can diff against the input to learn which ones failed.
+
+        When the DB lookup misses, falls back to an exact match in the
+        platform directory, so a person who has never messaged through Switch
+        still resolves. A hit is persisted (an ``ExternalUser`` row and its
+        puppet), so room membership, addressing and export all see the same
+        person this resolution found.
         """
         async with self._session_factory() as session:
             users = await self._external_user_store.get_by_bridge(
@@ -954,6 +1282,29 @@ class BridgeCore:
             if ext_id:
                 resolved[name] = ext_id
             else:
+                # Exact match on username or email only: a fuzzy directory
+                # hit is a real person, and being wrong invites a stranger
+                # into a private channel.
+                try:
+                    results = await self.adapter.search_directory_users(name)
+                    match = next(
+                        (
+                            r
+                            for r in results
+                            if r.username == name
+                            or (r.email is not None and r.email.lower() == name.lower())
+                        ),
+                        None,
+                    )
+                    if match:
+                        ext = await self.ensure_external_user(
+                            external_user_id=match.external_user_id,
+                            external_username=match.username,
+                        )
+                        resolved[name] = ext.external_user_id
+                        continue
+                except (NotImplementedError, RuntimeError):
+                    pass
                 logger.warning(
                     "No external user found for username '%s' on bridge %s",
                     name,
@@ -971,17 +1322,27 @@ class BridgeCore:
         matrix_room_id: str,
         user_names: list[str],
     ) -> None:
-        """For each known external user matching one of `user_names` on this
-        bridge, ensure a running puppet client exists and is joined to the
-        Matrix room. Names without an existing ExternalUser row are skipped
-        — they will be picked up by the on_user_joined callback (when the
-        adapter sees them join externally) or by the lazy inbound-message
-        path."""
-        async with self._session_factory() as session:
-            users = await self._external_user_store.get_by_bridge_and_names(
-                session, self._bridge_id, user_names
-            )
-        for ext_user in users:
+        """For each resolvable name in `user_names`, ensure a running puppet
+        client exists and is joined to the Matrix room.
+
+        Resolution goes through `resolve_external_user_id_map`, the same
+        answer the channel-invite path uses, so a person the platform
+        directory can find is added here too. Unresolvable names are skipped
+        (the resolver logs them); the on_user_joined callback or the inbound
+        message path picks them up later."""
+        resolved = await self.resolve_external_user_id_map(user_names)
+        for ext_id in resolved.values():
+            async with self._session_factory() as session:
+                ext_user = await self._external_user_store.get_by_external_id(
+                    session, self._bridge_id, ext_id
+                )
+            if ext_user is None:
+                logger.error(
+                    "External user %s resolved on bridge %s but has no record",
+                    ext_id,
+                    self._bridge_id,
+                )
+                continue
             await self._ensure_user_in_matrix_room(
                 external_user_id=ext_user.external_user_id,
                 external_username=ext_user.external_username,
@@ -1035,6 +1396,354 @@ class BridgeCore:
             )
             return None
         return puppet
+
+    async def _handle_inbound_interaction(
+        self, interaction: InboundInteraction
+    ) -> None:
+        """Someone operated a control on a message this bridge posted."""
+        if interaction.action_id == INTERRUPT_ACTION:
+            await self._handle_interrupt_press(interaction)
+            return
+        interactions = self._session_interactions
+        if interactions is None:
+            return
+        outcome = await interactions.command_for(interaction)
+        if isinstance(outcome, Refused):
+            # outcome.card_ref is available here too, but deliberately unused:
+            # the thread comes off the press, which is right even when the card
+            # behind it no longer resolves.
+            await self._tell_refused(
+                interaction, outcome, thread_ref=interaction.thread_ref
+            )
+            return
+        # Both ways a press can be turned down go the same way out. The two
+        # were split once, and the half that went through the channel put one
+        # person's rejected approval in front of everybody in it.
+        await self._submit_session_command(
+            outcome,
+            interaction,
+            thread_ref=interaction.thread_ref,
+            refusal="Your answer was not accepted",
+            accepted=None,
+        )
+
+    async def _handle_interrupt_press(self, interaction: InboundInteraction) -> None:
+        """Someone pressed stop on the message showing what an agent is doing.
+
+        Two things are taken from the press and no more: which message it was
+        on, and who the platform says pressed it. The session, its epoch and
+        the room come from the journal entry behind that message; the turn to
+        stop comes from the control, bound when the message was drawn. So a
+        payload cannot name a session it was never shown, and a press on a
+        message that has not been redrawn since another turn started names the
+        turn the reader could see rather than the one running now.
+
+        Authority is not decided here. The session checks a press from a
+        channel against the same room membership it checks `!interrupt`
+        against, and its refusal comes back privately like any other.
+        """
+        publisher = self._session_publisher
+        if publisher is None or interaction.message_ref is None:
+            return
+        target = await self._activity_control_at(
+            interaction.channel_id, interaction.message_ref
+        )
+        if target is None:
+            logger.warning(
+                "Ignoring a stop press in %s on bridge %s: message %s shows no "
+                "turn this bridge can still reach.",
+                interaction.channel_id,
+                self._bridge_id,
+                interaction.message_ref,
+            )
+            await self._adapter.tell_actor(
+                interaction.channel_id,
+                interaction.sender_id,
+                interaction.sender_name,
+                interaction.thread_ref,
+                "That message is no longer connected to a live session, so "
+                "there is nothing here to stop.",
+            )
+            return
+        actor_id = await self._identify_actor(interaction)
+        if actor_id is None:
+            logger.warning(
+                "Ignoring a stop press on session %s: no Switch identity for %s "
+                "on bridge %s. Stopping an agent is only ever attributed to a "
+                "verified actor.",
+                target.session_id,
+                interaction.sender_id,
+                self._bridge_id,
+            )
+            await self._adapter.tell_actor(
+                interaction.channel_id,
+                interaction.sender_id,
+                interaction.sender_name,
+                interaction.thread_ref,
+                "Switch does not know who this account belongs to, and "
+                "stopping an agent is only ever recorded against someone it "
+                "can name.",
+            )
+            return
+        command = interrupt_command(
+            target,
+            turn_id=interaction.value,
+            message_ref=interaction.message_ref,
+            origin=Origin(
+                surface=cast(Surface, self._bridge_type),
+                actor_id=actor_id,
+                room_id=target.room_id,
+                thread_id=target.thread_id,
+                message_id=interaction.message_ref,
+            ),
+        )
+        await self._submit_session_command(
+            command,
+            interaction,
+            thread_ref=interaction.thread_ref,
+            refusal="The agent was not stopped",
+            accepted=(
+                "Switch has asked the agent to stop its current work. The "
+                "activity message will say when it has."
+            ),
+        )
+
+    async def _activity_control_at(
+        self, channel_id: str, ref: str
+    ) -> ActivityControlTarget | None:
+        """Where a control on one of our messages submits, tenant-bound.
+
+        Scoped the same way as `_activity_shown_at` and for the same reason:
+        a press arrives from the platform's own event loop carrying nothing
+        that says which tenant its channel belongs to.
+        """
+        publisher = self._session_publisher
+        if publisher is None:
+            return None
+        room_ids = self._channel_to_room.get(channel_id)
+        tenant_id = (
+            self._bridge_tenant_id
+            if room_ids is None
+            else await self._room_tenant(room_ids[0])
+        )
+        with tenant_scope(tenant_id):
+            return await publisher.activity_control_at(channel_id, ref)
+
+    async def _activity_shown_at(
+        self, channel_id: str, ref: str
+    ) -> ActivitySnapshot | None:
+        """What turn a message of ours is showing, for an adapter that is asked.
+
+        Tenant-bound here for the same reason every inbound path is bound in
+        `_traced`: the platform calls this from wherever its own event loop
+        happens to be, and nothing about a Discord press says which tenant its
+        channel belongs to. A channel with no room is not one this bridge has
+        published a turn into, so the read is scoped to the bridge's own
+        tenant and finds nothing, rather than guessing at another's.
+        """
+        publisher = self._session_publisher
+        if publisher is None:
+            return None
+        room_ids = self._channel_to_room.get(channel_id)
+        tenant_id = (
+            self._bridge_tenant_id
+            if room_ids is None
+            else await self._room_tenant(room_ids[0])
+        )
+        with tenant_scope(tenant_id):
+            return await publisher.activity_shown_at(channel_id, ref)
+
+    async def _handle_text_answer(self, msg: InboundMessage) -> None:
+        """The same answer, typed rather than pressed.
+
+        Runs alongside the relay rather than instead of it: an answer is also
+        something the person said in the channel, and the room sees it either
+        way.
+        """
+        interactions = self._session_interactions
+        if interactions is None:
+            return
+        outcome = await interactions.command_for_text(msg)
+        if isinstance(outcome, Refused):
+            # The card's own thread, not wherever the answer was typed: a
+            # handle answers a card from anywhere in the channel, including
+            # the root, where `msg.root_id` is None and there would be
+            # nothing to say it in.
+            await self._tell_refused(msg, outcome, thread_ref=outcome.card_ref)
+            return
+        await self._submit_session_command(
+            outcome,
+            msg,
+            thread_ref=msg.root_id or msg.message_ref,
+            refusal="Your answer was not accepted",
+            accepted=None,
+        )
+
+    async def _tell_refused(
+        self, actor: InboundActor, refused: Refused, thread_ref: str | None
+    ) -> None:
+        """Tell whoever answered that it did not land.
+
+        The refusal is already in the log by the time this runs; this is the
+        half of it the person can see. How privately depends on the platform,
+        and a platform that cannot say it at all logs and returns, so this is
+        best effort by design and never the thing that decides an answer.
+        """
+        await self._adapter.tell_actor(
+            actor.channel_id,
+            actor.sender_id,
+            actor.sender_name,
+            thread_ref,
+            refused.told(),
+        )
+
+    async def _handle_session_demo(self, cmd: InboundCommand, room_id: str) -> bool:
+        """Whether this was the demo trigger, having acted on it if so.
+
+        A command rather than a message, because the trigger starts with `!`
+        and every adapter routes a leading `!` to the command hook. Watching
+        the message path for it — which is where this started — meant watching
+        somewhere it could never arrive, and what a channel actually got was
+        the room's "unknown command".
+
+        So it is answered here and consumed: nothing is bridged for it, which
+        is the whole point. Takes the room rather than looking it up, because
+        it runs after the channel has one — a channel is mapped lazily on its
+        first message, and a channel nobody has spoken in yet is exactly the
+        one somebody makes to show this off.
+
+        A failure is reported into the channel rather than raised: this runs on
+        the inbound path ahead of the relay, and a demo that cannot post a card
+        must not also cost the room the command.
+        """
+        demo = self._session_demo
+        if demo is None:
+            return False
+        trigger_ref = cmd.root_id or cmd.message_ref
+        content = f"!{cmd.command} {cmd.args}".strip()
+        try:
+            return await demo.handle(content, cmd.channel_id, room_id)
+        except Exception as error:
+            logger.error(
+                "The demo card for channel %s could not be posted: %s",
+                cmd.channel_id,
+                error,
+            )
+            await self._adapter.admin_message(
+                cmd.channel_id,
+                f"The demo request card could not be posted: {error}",
+                trigger_ref,
+            )
+            return True
+
+    async def refresh_sdk_session(self, session_id: str) -> None:
+        if self._session_publisher is not None:
+            self._session_publisher.wake()
+
+    async def _submit_session_command(
+        self,
+        command: Command | None,
+        actor: InboundActor,
+        thread_ref: str | None,
+        refusal: str,
+        accepted: str | None,
+    ) -> None:
+        """Give the session the answer, and tell the answerer if it bounced.
+
+        Authority is the second thing that can turn an answer down, after the
+        resolution that built it, and it turns down the same kinds of thing:
+        not yours to decide, too late, already answered. So it is reported the
+        same way — to the person who answered, as privately as the platform
+        allows — rather than as a notice to the channel. `tell_actor` is what
+        knows the difference per platform, and on a platform with no private
+        reply it still lands in the card's thread, which is where this used to
+        post anyway.
+
+        A refusal arrives two ways and reads the same either way. Authority
+        raises the ones that are about the sender — not linked, not allowed,
+        an id already spent on something else — and hands back the ones that
+        are about the session, a turn that has already ended or a host that
+        cannot be interrupted at all, as a rejected receipt. The second kind is
+        the one a stale control produces, so a receipt that is not read is a
+        press that answers nothing.
+
+        `thread_ref` is the thread the answered message sits in, and a press
+        takes it from the press itself rather than from anything it resolves
+        to. Most platforms never read it, because an interaction is answered
+        through itself and lands where it was made. Slack has no such reply: it
+        posts an ephemeral, which goes to the channel root unless it is told a
+        thread, so a notice about a control in a thread would otherwise surface
+        under the channel instead of beside the message it is about.
+
+        Reading it off the press is what makes the refusals work. A press that
+        resolves to nothing, or comes from an account with no Switch identity,
+        is turned down before there is any journal entry to ask — and those are
+        exactly the answers a reader is least equipped to place on their own.
+
+        `refusal` opens that sentence, because not every control is an answer:
+        a stop button turned down has to say the agent is still running, not
+        that an answer did not land. `accepted` is the counterpart for a
+        control whose success the channel does not otherwise show, and it is
+        None where a redrawn card is the acknowledgement. It can only ever say
+        that Switch took the request; whether the agent has stopped is the
+        provider's to report, and it reports it by ending the turn.
+        """
+        if command is None:
+            return
+        try:
+            receipt = await self._session_authority.submit(
+                command, user_id=None, bridge_id=self._bridge_id
+            )
+        except SessionError as error:
+            await self._adapter.tell_actor(
+                actor.channel_id,
+                actor.sender_id,
+                actor.sender_name,
+                thread_ref,
+                f"{refusal} ({error.code}): {error}",
+            )
+            return
+        if receipt.status == "rejected":
+            await self._adapter.tell_actor(
+                actor.channel_id,
+                actor.sender_id,
+                actor.sender_name,
+                thread_ref,
+                f"{refusal} ({receipt.code}): {receipt.message}",
+            )
+            return
+        if accepted is not None:
+            await self._adapter.tell_actor(
+                actor.channel_id,
+                actor.sender_id,
+                actor.sender_name,
+                thread_ref,
+                accepted,
+            )
+        await self.refresh_sdk_session(command.session_id)
+
+    async def _identify_actor(self, actor: InboundActor) -> str | None:
+        """The Switch identity behind the platform account that acted.
+
+        None where the channel maps to no room, or the puppet cannot be brought
+        into it. Both are refusals: an answer carries who gave it, and there is
+        no default actor to fall back on.
+        """
+        room_ids = self._channel_to_room.get(actor.channel_id)
+        if room_ids is None:
+            logger.warning(
+                "Ignoring an answer in %s: the channel maps to no room",
+                actor.channel_id,
+            )
+            return None
+        room_id, matrix_room_id = room_ids
+        puppet = await self._ensure_user_in_matrix_room(
+            external_user_id=actor.sender_id,
+            external_username=actor.sender_name,
+            room_id=room_id,
+            matrix_room_id=matrix_room_id,
+        )
+        return puppet.matrix_user_id if puppet is not None else None
 
     async def _handle_user_joined_channel(self, join: InboundUserJoin) -> None:
         """Called by the adapter when an external user joins a bridged
@@ -1184,61 +1893,77 @@ class BridgeCore:
     async def _create_puppet(
         self, external_user_id: str, external_username: str
     ) -> str:
+        """Mint the Matrix identity that stands in for a person on the platform.
+
+        Bound to the **bridge's** tenant, not to whatever room the message
+        that triggered it arrived in. A puppet is per-bridge and outlives that
+        message: the same client is reused for every room this person speaks
+        in, so a client row stamped with the first room's tenant would be
+        wrong for the second — and the client task it starts must not carry
+        that tenant either, which is why `ClientLifecycleService` unbinds
+        before running one.
+        """
         lock = self._puppet_locks.setdefault(external_user_id, asyncio.Lock())
         async with lock:
-            existing = self._user_puppets.get(external_user_id)
-            if existing is not None:
-                return existing
-
-            # Defence in depth against agent/user misdetection: a
-            # bridged agent must never be puppeted as an external user. If the
-            # name collides with a registered Switch agent, refuse loudly rather
-            # than create a duplicate "user" identity for it.
-            async with self._session_factory() as session:
-                agent = await self._agent_store.get_by_name(session, external_username)
-            if agent is not None:
-                raise ValueError(
-                    f"Refusing to create external-user puppet for '{external_username}'"
-                    " on bridge "
-                    f"{self._bridge_id}: name collides with a registered Switch agent"
-                    " (likely a bridged agent bot misclassified as a user)"
+            with tenant_scope(self._bridge_tenant_id):
+                return await self._create_puppet_locked(
+                    external_user_id, external_username
                 )
 
-            sanitized = re.sub(r"[^a-z0-9_-]", "-", external_username.lower()).strip(
-                "-"
-            )
-            # Scope to the bridge: the same username on two bridges of the same
-            # type (e.g. two Slack workspaces) must map to distinct Matrix users,
-            # since matrix_user_id is globally unique but usernames are not.
-            localpart = f"switch-{self._bridge_type}-{self._bridge_id}-{sanitized}"
+    async def _create_puppet_locked(
+        self, external_user_id: str, external_username: str
+    ) -> str:
+        existing = self._user_puppets.get(external_user_id)
+        if existing is not None:
+            return existing
 
-            client = await self._client_lifecycle.create_and_start(
-                client_type="user",
-                display_name=external_username,
-                localpart=localpart,
+        # Defence in depth against agent/user misdetection: a
+        # bridged agent must never be puppeted as an external user. If the
+        # name collides with a registered Switch agent, refuse loudly rather
+        # than create a duplicate "user" identity for it.
+        async with self._session_factory() as session:
+            agent = await self._agent_store.get_by_name(session, external_username)
+        if agent is not None:
+            raise ValueError(
+                f"Refusing to create external-user puppet for '{external_username}'"
+                " on bridge "
+                f"{self._bridge_id}: name collides with a registered Switch agent"
+                " (likely a bridged agent bot misclassified as a user)"
             )
 
-            ext_user = ExternalUser(
-                bridge_id=self._bridge_id,
-                external_user_id=external_user_id,
-                external_username=external_username,
-                client_id=client.client_id,
-            )
-            async with self._session_factory() as session:
-                await self._external_user_store.create(session, ext_user)
-                await session.commit()
+        sanitized = re.sub(r"[^a-z0-9_-]", "-", external_username.lower()).strip("-")
+        # Scope to the bridge: the same username on two bridges of the same
+        # type (e.g. two Slack workspaces) must map to distinct Matrix users,
+        # since matrix_user_id is globally unique but usernames are not.
+        localpart = f"switch-{self._bridge_type}-{self._bridge_id}-{sanitized}"
 
-            self._user_puppets[external_user_id] = client.client_id
-            self._puppet_matrix_ids.add(client.matrix_user_id)
-            self._adapter.prime_mention_targets({external_username: external_user_id})
+        client = await self._client_lifecycle.create_and_start(
+            client_type="user",
+            display_name=external_username,
+            localpart=localpart,
+        )
 
-            logger.info(
-                "Created puppet %s for external user %s on bridge %s",
-                client.matrix_user_id,
-                external_user_id,
-                self._bridge_id,
-            )
-            return client.client_id
+        ext_user = ExternalUser(
+            bridge_id=self._bridge_id,
+            external_user_id=external_user_id,
+            external_username=external_username,
+            client_id=client.client_id,
+        )
+        async with self._session_factory() as session:
+            await self._external_user_store.create(session, ext_user)
+            await session.commit()
+
+        self._user_puppets[external_user_id] = client.client_id
+        self._puppet_matrix_ids.add(client.matrix_user_id)
+        self._adapter.prime_mention_targets({external_username: external_user_id})
+
+        logger.info(
+            "Created puppet %s for external user %s on bridge %s",
+            client.matrix_user_id,
+            external_user_id,
+            self._bridge_id,
+        )
+        return client.client_id
 
     def _find_channel(
         self, room_id: str | None = None, matrix_room_id: str | None = None
@@ -1273,29 +1998,41 @@ class BridgeCore:
             logger.debug("[BRIDGE-OUT] no channel mapping for room %s", room.room_id)
             return
 
+        room_id, _ = self._channel_to_room[channel_id]
+        with tenant_scope(await self._room_tenant(room_id)):
+            with self._counted_outbound("message"):
+                await self._relay_outbound_message(channel_id, event)
+
+    async def _relay_outbound_message(
+        self, channel_id: str, event: TransportMessage
+    ) -> None:
         event_content = event.content
         admin_marker = event_content.get(ADMIN_MARKER)
+        platform_marker = event_content.get(PLATFORM_MARKER)
         sender_name = event.sender_name
-        # An admin/system message renders natively per bridge (admin_message)
-        # rather than on behalf of its Matrix sender, so it needs no sender_name.
-        if sender_name is None and admin_marker is None:
+        # An admin/system or platform message renders natively per bridge
+        # (admin_message) rather than on behalf of its Matrix sender, so it
+        # needs no sender_name.
+        is_system = admin_marker is not None or platform_marker is not None
+        if sender_name is None and not is_system:
             logger.error(
                 "No sender_name in event from %s — skipping outbound", event.sender
             )
             return
 
         logger.debug(
-            "[BRIDGE-OUT] sending to channel=%s sender=%s admin=%s",
+            "[BRIDGE-OUT] sending to channel=%s sender=%s admin=%s platform=%s",
             channel_id,
             sender_name,
             admin_marker is not None,
+            platform_marker is not None,
         )
 
         thread_root_ref = await self._outbound_thread_root_ref(
             event_content, channel_id
         )
 
-        if admin_marker is not None:
+        if is_system:
             message_type = (
                 admin_marker.get("type") if isinstance(admin_marker, dict) else None
             )
@@ -1304,9 +2041,20 @@ class BridgeCore:
             # here as well ran the body through twice, and the second pass
             # escapes the markup the first one produced — a command reply
             # arrived showing its own `<b>` tags.
+            # A platform message sent for a person says so, so the room sees
+            # whose authority it carries. A thread reply sits under a root that
+            # already said it, and a body naming the person needs no second line.
+            body = event.body
+            person = platform_on_behalf_of(event_content)
+            if (
+                person is not None
+                and not _is_thread_reply(event_content)
+                and f"@{person.name}" not in body
+            ):
+                body = f"On behalf of @{person.name}:\n\n{body}"
             message_ref = await self._adapter.admin_message(
                 channel_id,
-                event.body,
+                body,
                 thread_root_ref,
                 message_type=message_type,
             )
@@ -1324,11 +2072,6 @@ class BridgeCore:
                 external_channel_id=channel_id,
                 transport_event_id=event.event_id,
                 external_post_id=message_ref,
-            )
-
-        if sender_name is not None:
-            await self._move_indicator_for_sender(
-                channel_id, sender_name, thread_root_ref
             )
 
     async def _outbound_thread_root_ref(
@@ -1389,6 +2132,14 @@ class BridgeCore:
             logger.debug("[BRIDGE-OUT] no channel mapping for room %s", room.room_id)
             return
 
+        room_id, _ = self._channel_to_room[channel_id]
+        with tenant_scope(await self._room_tenant(room_id)):
+            with self._counted_outbound("media"):
+                await self._relay_outbound_media(channel_id, event, client)
+
+    async def _relay_outbound_media(
+        self, channel_id: str, event: TransportMedia, client: ClientBase[Any]
+    ) -> None:
         event_content = event.content
         sender_name = event.sender_name
         if sender_name is None:
@@ -1411,9 +2162,11 @@ class BridgeCore:
         caption = event.body if explicit_filename else None
 
         info = event_content.get("info") or {}
-        mimetype = str(
-            (info.get("mimetype") if isinstance(info, dict) else None)
-            or "application/octet-stream"
+        mimetype = normalise_mime_type(
+            str(
+                (info.get("mimetype") if isinstance(info, dict) else None)
+                or "application/octet-stream"
+            )
         )
 
         message_ref: str | None
@@ -1478,8 +2231,6 @@ class BridgeCore:
                 transport_event_id=event.event_id,
                 external_post_id=message_ref,
             )
-
-        await self._move_indicator_for_sender(channel_id, sender_name, thread_root_ref)
 
     def _schedule_outbound_group_flush(
         self,
@@ -1563,8 +2314,6 @@ class BridgeCore:
                 external_post_id=message_ref,
             )
 
-        await self._move_indicator_for_sender(channel_id, sender_name, thread_root_ref)
-
     async def _download_matrix_media(
         self, client: ClientBase[Any], mxc: str | None, filename: str
     ) -> bytes | None:
@@ -1595,118 +2344,6 @@ class BridgeCore:
 
         await self._adapter.send_typing(channel_id, agent_name, is_typing)
 
-    async def handle_agent_runtime_state(
-        self, room: RoomRef, event: AgentRuntimeStateEvent
-    ) -> None:
-        """Resolve the channel and let the adapter surface the runtime state.
-
-        Each platform decides how to render it (see
-        ``CollaborationAdapter.apply_runtime_state``). When the triggering
-        message was in a thread, the state surfaces in that same thread: the
-        event's `thread_id` (a Matrix event id) is resolved to the external
-        thread root via the same map outbound replies use.
-
-        Addressed at the conversation root there is no `thread_id`, and on an
-        adapter that asks for it the reported anchor — the last message the
-        agent was handed — stands in, so the status joins the thread the reply
-        opens on that message instead of sitting at the channel root beside it.
-        """
-        channel_id = self._find_channel(matrix_room_id=room.room_id)
-        if channel_id is None:
-            logger.debug(
-                "[BRIDGE-OUT] no channel mapping for runtime-state room %s",
-                room.room_id,
-            )
-            return
-
-        # Where the triggering message itself sits — None when it came from the
-        # channel root. This is what a typing indicator follows.
-        trigger_thread_ref: str | None = None
-        if event.thread_id is not None:
-            trigger_thread_ref = await self._external_post_for_matrix_event(
-                event.thread_id
-            )
-
-        # The message the agent says it is answering. Resolved whichever way
-        # the status is positioned, so an adapter can mark that message without
-        # also moving the status onto it.
-        anchor_message_ref: str | None = None
-        if event.anchor_event_id is not None:
-            anchor_message_ref = await self._external_post_for_matrix_event(
-                event.anchor_event_id
-            )
-
-        # Where a persistent status belongs, which on an adapter that asks for
-        # it is the thread the reply will open on the message being worked on.
-        anchor_ref = event.thread_id
-        if anchor_ref is None and self._adapter.runtime_state_follows_anchor:
-            anchor_ref = event.anchor_event_id
-
-        thread_root_ref: str | None = trigger_thread_ref
-        if anchor_ref is not None and anchor_ref != event.thread_id:
-            thread_root_ref = await self._external_post_for_matrix_event(anchor_ref)
-        if anchor_ref is not None and thread_root_ref is None:
-            logger.debug(
-                "[BRIDGE-OUT] no external post mapped for runtime-state thread "
-                "%s; surfacing at channel root in %s",
-                anchor_ref,
-                channel_id,
-            )
-
-        await self._adapter.apply_runtime_state(
-            channel_id,
-            event.agent_name,
-            event.state,
-            mention_handle=event.mention_handle,
-            thread_root_id=thread_root_ref,
-            deeplink_url=event.deeplink_url,
-            detail=event.detail,
-            trigger_thread_root_id=trigger_thread_ref,
-            anchor_message_ref=anchor_message_ref,
-        )
-        await self._follow_reported_anchor(
-            channel_id,
-            event.agent_name,
-            event.state,
-            event.anchor_event_id,
-            thread_root_ref,
-        )
-
-    async def _follow_reported_anchor(
-        self,
-        channel_id: str,
-        agent_name: str,
-        state: str,
-        anchor_event_id: str | None,
-        thread_root_ref: str | None,
-    ) -> None:
-        """Move the indicator when the agent reports it has been handed a
-        newer message than the one it was last positioned against.
-
-        Position follows what the agent has actually received, not what merely
-        arrived in the room — a message the agent has not been given yet must
-        not make the indicator look like the agent has seen it. The periodic
-        activity refresh repeats the current anchor, so it never moves anything.
-        """
-        key = (channel_id, agent_name)
-        if state != "working":
-            self._reported_anchors.pop(key, None)
-            return
-        if anchor_event_id is None:
-            return
-
-        if self._reported_anchors.get(key) == anchor_event_id:
-            return
-        previous = self._reported_anchors.get(key)
-        self._reported_anchors[key] = anchor_event_id
-        if previous is None:
-            # First anchor of the turn — the indicator was only just posted
-            # against it, so there is nothing to move.
-            return
-
-        self._indicator_move_targets[key] = thread_root_ref
-        await self._run_indicator_move(key)
-
     # ── Protection sync ──────────────────────────────────────────────────────
 
     # TODO: use this when protection setup is done
@@ -1733,63 +2370,6 @@ class BridgeCore:
         else:
             translated = self._adapter.translate_outbound(new_content)
             await self._adapter.update_message(channel_id, message_ref, translated)
-
-    # ── Runtime-indicator positioning ─────────────────────────────────────────
-
-    async def _move_indicator_for_sender(
-        self, channel_id: str, agent_name: str, thread_root_id: str | None
-    ) -> None:
-        """Follow a message the agent itself just posted."""
-        if agent_name in self._adapter.agents_with_live_runtime_state(channel_id):
-            self._schedule_indicator_move(channel_id, agent_name, thread_root_id)
-
-    def _schedule_indicator_move(
-        self, channel_id: str, agent_name: str, thread_root_id: str | None
-    ) -> None:
-        """Queue a move of this agent's runtime indicator, coalescing bursts.
-
-        Messages arriving while a move is already queued are absorbed into it,
-        so a rapid exchange costs one delete-and-repost rather than one per
-        message. The delay is deliberately not extended by later messages —
-        a sustained conversation would otherwise starve the move indefinitely.
-
-        ``thread_root_id`` is the thread the triggering message belongs to, and
-        the one the indicator will land in. A coalesced burst keeps the most
-        recent one, so the indicator follows the conversation's latest thread
-        rather than the one that opened the window.
-        """
-        key = (channel_id, agent_name)
-        self._indicator_move_targets[key] = thread_root_id
-        if key in self._indicator_move_timers:
-            return
-
-        loop = asyncio.get_running_loop()
-        self._indicator_move_timers[key] = loop.call_later(
-            _INDICATOR_MOVE_DELAY_SECONDS,
-            lambda: asyncio.ensure_future(self._run_indicator_move(key)),
-        )
-
-    async def _run_indicator_move(self, key: tuple[str, str]) -> None:
-        # An anchor-driven move runs immediately rather than through the timer,
-        # so a coalescing window opened by outbound traffic may still be
-        # pending; it would otherwise fire a second, redundant move.
-        timer = self._indicator_move_timers.pop(key, None)
-        if timer is not None:
-            timer.cancel()
-        thread_root_id = self._indicator_move_targets.pop(key, None)
-        channel_id, agent_name = key
-        try:
-            await self._adapter.reposition_runtime_state(
-                channel_id, agent_name, thread_root_id
-            )
-        except Exception:
-            # The indicator is cosmetic; a platform failure here must not take
-            # down the bridge callback that happened to trigger it.
-            logger.exception(
-                "[BRIDGE-OUT] failed to move the runtime indicator for %s in %s",
-                agent_name,
-                channel_id,
-            )
 
     # ── Message-map helpers ───────────────────────────────────────────────────
 
@@ -1870,14 +2450,29 @@ class BridgeCore:
         self._provisioning_channels.discard(external_channel_id)
 
     def add_room_mapping(
-        self, room_id: str, matrix_room_id: str, external_channel_id: str
+        self,
+        room_id: str,
+        matrix_room_id: str,
+        external_channel_id: str,
+        tenant_id: str,
     ) -> None:
+        """Register a room↔channel mapping, and the room's tenant with it.
+
+        The tenant is a required argument rather than something looked up
+        later because every caller already has the room row in hand. Taking it
+        here is what lets `_traced` bind a tenant for a room created *after*
+        this bridge started without a database read on the inbound path — and,
+        more to the point, without a read that would run under whatever tenant
+        happened to be bound at the time.
+        """
         key = (room_id, matrix_room_id)
         self._channel_to_room[external_channel_id] = key
         self._room_to_channel[key] = external_channel_id
+        self._room_tenants[room_id] = tenant_id
 
     def remove_room_mapping(self, room_id: str, matrix_room_id: str) -> None:
         key = (room_id, matrix_room_id)
         channel_id = self._room_to_channel.pop(key, None)
         if channel_id is not None:
             self._channel_to_room.pop(channel_id, None)
+        self._room_tenants.pop(room_id, None)

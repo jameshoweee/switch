@@ -4,6 +4,7 @@ import asyncio
 import logging
 import random
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, NamedTuple, Unpack
 
@@ -28,6 +29,11 @@ from switch_core.bridges.agent.protocol.types import (
     TaskFinalisePayload,
     TaskUpdatePayload,
 )
+from switch_core.clients.admin_messages import (
+    PLATFORM_MARKER,
+    platform_on_behalf_of,
+    platform_replies_in_channel,
+)
 from switch_core.clients.client_base import (
     ClientBase,
     ClientBaseKwargs,
@@ -44,6 +50,7 @@ from switch_core.clients.mentions import (
 )
 from switch_core.clients.room_meta import RoomMeta
 from switch_core.db.models import Agent
+from switch_core.db.session_scope import tenant_session
 from switch_core.db.stores.agent_session_store import AgentSessionStore
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
@@ -297,7 +304,16 @@ class AgentClient(ClientBase[ClientConfig]):
         return self.agent
 
     async def start(self) -> None:
-        async with self.session_factory() as session:
+        """Resolve the agent this client is, then run.
+
+        This runs at the top of the client's own task, which binds nothing, so
+        the tenant is carried rather than inherited: it comes from the
+        `clients` row this client was built from. A *guessed* tenant would
+        turn "this client is an agent" into "no agent found for client" and
+        fail the client at boot over a row that exists, which is why nothing
+        here falls back to whatever is ambient.
+        """
+        async with tenant_session(self.session_factory, self.tenant_id) as session:
             agent = await self._agent_store.get_by_client_id(session, self.client_id)
             if agent is None:
                 raise RuntimeError(f"No agent found for client: {self.client_id}")
@@ -326,6 +342,28 @@ class AgentClient(ClientBase[ClientConfig]):
         else:
             greeting = random.choice(AGENT_GREETINGS).format(name=name)
         await self.send_message(room.room_id, greeting, format="markdown")
+
+    async def on_removed(self, room: RoomRef, event: InboundMembership) -> None:
+        """Forget the room's events, everywhere this agent could still read them.
+
+        Dropping the subscription only stops what has not been read yet. What
+        has already been read is in the event buffer, which is keyed by agent
+        and knows nothing about who is in what: it holds each event for the
+        retention window and will serve it to a long poll, to the notification
+        stream, or to an SSE reader resuming from an old cursor. Without this
+        an agent removed from a room keeps being handed that room's backlog
+        from every one of those, for as long as the window lasts.
+
+        Doing it here, once, is why the readers do not each have to re-derive
+        membership. The poll paths check it against the database anyway,
+        because that is the authoritative answer and this signal is in-process;
+        the stream has only this.
+        """
+        meta = await self._resolve_room_meta(room.room_id)
+        if meta is None:
+            return
+        self._event_buffer.drop_room(self.agent.id, meta.room_id)
+        self._connections.release_room_everywhere(self.agent.id, meta.room_id)
 
     async def _member_name(
         self, session: AsyncSession, event: InboundMembership
@@ -392,8 +430,13 @@ class AgentClient(ClientBase[ClientConfig]):
             return
 
         thread_id = event.thread_root_id
-
-        reply_thread_root = thread_id if thread_id is not None else event.event_id
+        if platform_replies_in_channel(event.content):
+            # A threaded kickoff that wants its work in the channel: the agent
+            # sees it as top-level, so its replies and notices go there.
+            thread_id = None
+            reply_thread_root = None
+        else:
+            reply_thread_root = thread_id if thread_id is not None else event.event_id
 
         # Every database read this message needs happens in one session, and
         # nothing is posted to Matrix while it is open. A busy room fans one
@@ -454,6 +497,17 @@ class AgentClient(ClientBase[ClientConfig]):
                 sender_name,
             )
 
+        sender_kind: str | None = None
+        on_behalf_of: str | None = None
+        if PLATFORM_MARKER in event.content:
+            sender_kind = "platform"
+            person = platform_on_behalf_of(event.content)
+            if person is not None:
+                # The agent answers the person the platform spoke for, not
+                # the admin client that carried the message.
+                on_behalf_of = person.name
+                sender_name = person.name
+
         agent_event = AgentEvent(
             type="message",
             room_id=meta.room_id,
@@ -463,6 +517,8 @@ class AgentClient(ClientBase[ClientConfig]):
                 addressed=is_addressed,
                 sender=event.sender,
                 sender_name=sender_name,
+                sender_kind=sender_kind,
+                on_behalf_of=on_behalf_of,
                 message_id=event.event_id,
                 body=text,
                 timestamp=event.timestamp,
@@ -652,6 +708,17 @@ class AgentClient(ClientBase[ClientConfig]):
                     room.room_id, event, gate.refusal, reply_thread_root
                 )
 
+        sender_kind: str | None = None
+        on_behalf_of: str | None = None
+        if PLATFORM_MARKER in event.content:
+            sender_kind = "platform"
+            person = platform_on_behalf_of(event.content)
+            if person is not None:
+                # The agent answers the person the platform spoke for, not
+                # the admin client that carried the message.
+                on_behalf_of = person.name
+                sender_name = person.name
+
         agent_event = AgentEvent(
             type="message",
             room_id=meta.room_id,
@@ -661,6 +728,8 @@ class AgentClient(ClientBase[ClientConfig]):
                 addressed=is_addressed,
                 sender=event.sender,
                 sender_name=sender_name,
+                sender_kind=sender_kind,
+                on_behalf_of=on_behalf_of,
                 message_id=event.event_id,
                 body=body,
                 timestamp=event.timestamp,
@@ -798,7 +867,7 @@ class AgentClient(ClientBase[ClientConfig]):
         if matrix_room_id in self._room_meta:
             return self._room_meta[matrix_room_id]
 
-        async with self.session_factory() as session:
+        async with tenant_session(self.session_factory, self.tenant_id) as session:
             room = await self._room_store.get_by_matrix_room_id(session, matrix_room_id)
             if room is None:
                 logger.error("Room not found for matrix room ID: %s", matrix_room_id)
@@ -1215,7 +1284,12 @@ class AgentClient(ClientBase[ClientConfig]):
         )
 
     async def _addressing_allowed(
-        self, session: AsyncSession, agent: Agent, matrix_sender: str, room_id: str
+        self,
+        session: AsyncSession,
+        agent: Agent,
+        matrix_sender: str,
+        room_id: str,
+        content: Mapping[str, object] | None = None,
     ) -> AddressingDecision:
         """Whether `matrix_sender` may address this agent in `room_id`, per the
         agent's scoped addressing policy.
@@ -1223,9 +1297,15 @@ class AgentClient(ClientBase[ClientConfig]):
         `agent` is the freshly-read row rather than the cached snapshot: the
         policy is the thing being enforced, and enforcing a stale copy of it is
         the one way this check can be wrong in the dangerous direction.
+        `content` is the event's content when there is one: a platform message
+        says there whose authority it carries.
         """
         return await self._addressing.permitted(
-            session, agent=agent, room_id=room_id, sender=matrix_sender
+            session,
+            agent=agent,
+            room_id=room_id,
+            sender=matrix_sender,
+            content=content,
         )
 
     async def _gate_addressed(
@@ -1244,7 +1324,7 @@ class AgentClient(ClientBase[ClientConfig]):
         tag this agent are ever checked, and open policies short-circuit.
         """
         decision = await self._addressing_allowed(
-            session, agent, event.sender, meta.room_id
+            session, agent, event.sender, meta.room_id, event.content
         )
         if decision.allowed:
             return _GateOutcome(addressed=True, refusal=None)
@@ -1310,6 +1390,9 @@ class AgentClient(ClientBase[ClientConfig]):
         (paired with `mentions=[event.sender]` so Matrix renders a pill).
         """
         content = event.content
+        person = platform_on_behalf_of(content)
+        if person is not None:
+            return person.name
         name = content.get("sender_name")
         if name:
             return str(name)

@@ -161,6 +161,9 @@ export const agents = sqliteTable(
     // Defaults false for local agents; onboarding seeds it true for remote
     // agents (see onboard-agent). Editable per agent in location settings.
     autoApprove: integer('auto_approve', { mode: 'boolean' }).notNull().default(false),
+    // The display name of the agent's owner on the Switch server, set when the
+    // agent was loaded from another install rather than created here.
+    ownerName: text('owner_name'),
     // Per-agent, provider-specific launch config (Codex model / effort /
     // instructions folded into the agent's Codex profile). Null when unset.
     providerConfig: versionedJsonColumn(agentProviderConfig)('provider_config'),
@@ -179,9 +182,7 @@ export const agents = sqliteTable(
 
 /**
  * A session: one instantiation/run of an agent. This is the unit shown under an
- * agent in the sidebar. A session is 1:1 with its terminal (the PTY the agent
- * CLI runs in), so the terminal's `shellId` lives here rather than in a separate
- * table.
+ * agent in the sidebar. Each session is driven by its SDK provider adapter.
  */
 /**
  * An onboarded remote SSH host. Switch Console stores no credentials — a host is
@@ -272,7 +273,6 @@ export const sessions = sqliteTable(
     config: versionedJsonColumn(sessionConfig)('config'),
     shellId: text('shell_id').$type<TerminalShellId>().notNull().default('system'),
     status: text('status'),
-    agentSessionId: text('agent_session_id'),
     agentStatus: text('agent_status'),
     agentStatusSeen: integer('agent_status_seen').default(1),
     isInitialSession: integer('is_initial_session', { mode: 'boolean' }),

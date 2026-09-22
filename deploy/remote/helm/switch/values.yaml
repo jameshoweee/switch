@@ -32,6 +32,18 @@ ingress:
   # Emit ingress-nginx annotations that keep MCP/SSE streams alive (long read
   # timeouts, buffering off). Harmless on other controllers but ignored by them
   # — set false and add your controller's equivalents via annotations.
+  #
+  # Your controller almost certainly needs an equivalent, because the defaults
+  # elsewhere are short enough to cut an idle agent stream. An AWS ALB idles a
+  # connection out after 60 seconds; a GCE backend service after 30. On an ALB,
+  # add to annotations above:
+  #
+  #   alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=3600
+  #
+  # — a property of the load balancer rather than of this Ingress, so Ingresses
+  # sharing a group must all agree on the value or the controller reconciles
+  # none of them. On GCE it is `timeoutSec` on a BackendConfig, which is a
+  # separate object this chart does not render.
   streamingAnnotations: true
   tls:
     enabled: false
@@ -45,6 +57,7 @@ ingress:
     - /mcp
     - /oauth
     - /.well-known
+    - /messaging
     - /health
   # Path prefixes served by the Teams bridge listener rather than the FastAPI
   # app, because that listener is a separate HTTP server on its own port. Used
@@ -67,6 +80,8 @@ ingress:
 #    chart then renders no Secret and the values below are ignored. That Secret
 #    must contain these keys:
 #      POSTGRES_PASSWORD (unless postgresql.existingSecret is set),
+#      DB_OWNER_PASSWORD (only if postgresql.owner.username is set, and unless
+#        postgresql.owner.existingSecret is set),
 #      AGENT_REGISTRATION_TOKEN, JWT_SECRET_KEY, GATEWAY_ADMIN_EMAIL,
 #      GATEWAY_ADMIN_PASSWORD,
 #      MATTERMOST_ADMIN_PASSWORD + MATTERMOST_USER_PASSWORD (if mattermost.enabled),
@@ -76,6 +91,9 @@ secrets:
   # chart manages its own Secret from the values below.
   existingSecret: ""
   postgresPassword: ""
+  # Password for postgresql.owner.username. Required when that is set, unless
+  # postgresql.owner.existingSecret names a Secret that already carries it.
+  dbOwnerPassword: ""
   agentRegistrationToken: ""
   jwtSecretKey: ""
   gatewayAdminEmail: ""
@@ -84,12 +102,92 @@ secrets:
   mattermostUserPassword: ""
   # Gateway OIDC client secret (required when switchCore.oidc.enabled).
   gatewayOidcClientSecret: ""
+  # `key=value` pairs, comma-separated, sent on every OTLP request. Here rather
+  # than beside the other observability settings because the documented use for
+  # it is a collector's API key, and every other credential in this chart comes
+  # from the Secret. Left empty for a collector that needs no authentication.
+  otlpHeaders: ""
+  # Distributed Slack app (required when switchCore.slackApp.enabled). The
+  # signing secret is the whole of what distinguishes a real Slack event from
+  # a post by anyone who learned the URL.
+  slackAppClientSecret: ""
+  slackAppSigningSecret: ""
 
 # ── Switch Core (FastAPI) ─────────────────────────────────────────────────────
 switchCore:
   image: switch-core:latest
   imagePullPolicy: Always
   logLevel: INFO
+
+  # Logging. "text" is for reading in a terminal; "json" is what a log pipeline
+  # wants, and the only format that carries the context fields as fields — the
+  # tenant, and the request, agent and user a line belongs to — rather than
+  # inside the message. Set format: json anywhere the logs are collected.
+  #
+  # tenantId is a deployment-wide constant while Switch serves one organisation
+  # per deployment. Setting it per deployment is what lets one pipeline hold
+  # several and still tell them apart, so name the customer or the environment
+  # rather than leaving it at "default".
+  #
+  # environment and serviceName are emitted as `env` and `service`, the names
+  # a collector expects to group and filter on.
+  # rootLevel governs everything, libraries included; logLevel above is
+  # switch-core's own and is usually the one to change.
+  logging:
+    format: text
+    rootLevel: INFO
+    tenantId: default
+    environment: ""
+    serviceName: switch-core
+
+  # Where this deployment reports metrics and logs.
+  #
+  # Empty endpoint means it reports nowhere, which is the default: nothing
+  # leaves the deployment until an operator names a collector. Readiness
+  # checking is unaffected either way — /health/ready works regardless.
+  observability:
+    # Base URL of an OTLP/HTTP collector, with no path: `/v1/metrics` and
+    # `/v1/logs` are appended, the same convention every other OTLP client
+    # follows. Setting this is what turns reporting on.
+    otlpEndpoint: ""
+    # A UUID identifying this deployment, stable across restarts and upgrades.
+    # Required when otlpEndpoint is set — the collector drops what it cannot
+    # attribute, so without one this reports nothing while looking configured.
+    # Generate once with `uuidgen` and leave it alone; a new id per install
+    # makes one deployment look like a population of them.
+    deploymentId: ""
+    metrics: true
+    # Off by default: logs already go to the container's output, where a
+    # cluster log agent can read them. Turning this on sends a second copy
+    # over the network, which costs money somebody has to choose to spend.
+    logs: false
+    exportIntervalSeconds: 60
+    # How long an export may take before it is abandoned. Raise it for a
+    # collector that is slow or far away.
+    timeoutSeconds: 10
+
+  # Anonymous product telemetry: usage counts and timings reported to the
+  # Flint relay, which is the same pipeline Switch Console reports to.
+  #
+  # Off by default, and that is deliberate — this deployment's usage may be
+  # yours rather than ours, so reporting it is a choice you make rather than
+  # one you discover. When it is off nothing is collected and no request is
+  # made.
+  #
+  # Nothing that identifies anything inside the deployment is ever sent: no
+  # room, tenant, agent, user or message id, no names, no message content, and
+  # no free text of any kind. What is sent is counts (how many rooms, how many
+  # active users, how much traffic) and durations (how long from install to a
+  # working connector). The full list is in docs/old/telemetry-events.md and
+  # is enforced in code, not just documented.
+  telemetry:
+    enabled: false
+    # Base URL, no path — `/v1/logs` is appended, the same
+    # convention otlpEndpoint follows.
+    endpoint: https://telemetry.flintai.dev
+    # How often the usage snapshot is collected and sent.
+    snapshotIntervalHours: 24
+
   # Public base URL the gateway is served on (used for links / OIDC redirects).
   frontendBaseUrl: ""
   # Public origin (scheme + host, no path) of the gateway HTTP API itself, used
@@ -122,6 +220,24 @@ switchCore:
     requireEmailVerified: true
     # Set false to disable password login entirely (OIDC-only).
     passwordLoginEnabled: true
+  # The distributed Slack app: the one a customer installs into their workspace
+  # by clicking a button, as opposed to an app an operator registers themselves
+  # and pastes a bot token for. Off unless you have registered such an app and
+  # are distributing it — a self-hosted install almost certainly wants the
+  # per-tenant Socket Mode bridge instead.
+  #
+  # Enabling it commits the deployment to being reachable from the internet:
+  # Slack dials messagingPublicUrl and gives up on anything it cannot resolve
+  # or cannot verify a certificate for. Add /messaging to ingress.agentApiPaths
+  # as well, or the URLs exist and nothing routes to them.
+  slackApp:
+    enabled: false
+    # Public origin Slack reaches Switch on — scheme + host, https, no path.
+    # Not the same thing as gatewayPublicUrl, which is where a person lands
+    # from a deeplink and may be private; setting this one to that host would
+    # move every deeplink along with it.
+    messagingPublicUrl: ""
+    clientId: ""
   # Bearer-token resolution runs before every authenticated request and agents
   # beat continuously, so a successful resolution is memoised in process for
   # this many seconds. Only successes are cached — an unknown or revoked token
@@ -199,6 +315,36 @@ switchCore:
         # Secret holding the cert; cert-manager creates it from the annotation
         # above, or reference a pre-created TLS Secret.
         secretName: ""
+  # Collaboration callback listener. Mattermost's buttons are delivered by the
+  # Mattermost *server*, which POSTs a press to an address Switch hands it when
+  # it draws the card — so unlike Slack, Discord and Telegram, Mattermost's half
+  # of the conversation is not all on the outbound WebSocket. switch-core serves
+  # those presses from a third HTTP server, separate from the API on
+  # service.port and from the Teams listener above.
+  #
+  # Off by default for the same reason the Teams block is: bridges are created
+  # at runtime in the gateway, not in Helm values, so the chart cannot tell
+  # whether you have a Mattermost bridge. Leaving it off is a reduced service
+  # rather than a broken one, PROVIDED the bridge's callback_base_url is also
+  # unset: that is what the adapter checks before drawing a button, and it says
+  # so at startup. A bridge configured with an address whose port is not
+  # published here is the bad case — the cards carry buttons, and every press
+  # fails. Enable this, or clear the address; do not leave the two disagreeing.
+  #
+  # Any Mattermost inside the cluster needs only the Service port below, and
+  # the one this chart deploys is also told to accept that address when this is
+  # enabled — Mattermost refuses to call a private host it has not been given,
+  # so a server you manage yourself needs that entry adding even in-cluster.
+  # `helm install` prints the callback_base_url to configure on the bridge. A
+  # Mattermost OUTSIDE the cluster needs a route you own as well: this is a
+  # port switch-core binds, not necessarily a published host port, and the
+  # chart renders no Ingress for it.
+  collaborationCallback:
+    enabled: false
+    # Bind port inside the container. The chart sets no environment variable
+    # for it, so this must match switch-core's own COLLABORATION_CALLBACK_PORT
+    # default.
+    port: 8081
   # switch-core MUST run as a single replica. Four things live in the process
   # rather than the database: the per-agent event buffer, the invite bus, the
   # ephemeral (presence) bus, and the message listener's subscriber registry. A
@@ -307,6 +453,27 @@ postgresql:
   # managed cloud databases generally require "require" or stricter.
   sslMode: disable
 
+  # Certificate authorities the server certificate is checked against, as a PEM
+  # bundle. The two verifying sslModes require one and the others ignore one, so
+  # the chart refuses a mismatch rather than rendering a release that fails on
+  # first connect. A managed database is signed by the provider's own root
+  # rather than a publicly trusted one, which is why the system trust store is
+  # not enough; AWS publishes a bundle covering every commercial region at
+  # https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+  #
+  # Supply it inline as `contents` (rendered into a chart-managed ConfigMap) or
+  # name a ConfigMap you already have — not both. It is mounted into
+  # switch-core, the migration Job and Mattermost, all of which connect.
+  #
+  # verify-full additionally checks the hostname, so external.host must be the
+  # name the certificate was issued for — for RDS the instance endpoint, not a
+  # CNAME of your own. A CNAME means settling for verify-ca.
+  caBundle:
+    contents: ""
+    existingConfigMap: ""
+    key: ca.pem
+    mountPath: /etc/ssl/switch-db
+
   # switch-core's SQLAlchemy connection pool. Size this against the number of
   # live agent connections, not human traffic: bearer-token auth hits the
   # database on every authenticated request and each agent connection beats
@@ -323,6 +490,25 @@ postgresql:
     # SQLAlchemy's 30s default hides starvation as latency.
     timeout: 5
 
+  # How quickly switch-core notices a database server that stopped answering
+  # without closing its connections — what a managed instance does when it
+  # fails over to its standby. Nothing above the socket can tell: the
+  # connections stay open, reads never return, and the process goes on
+  # reporting itself healthy while delivering nothing. Left to the kernel's own
+  # defaults that lasts about fifteen minutes, all of it silent.
+  #
+  # Both mechanisms are needed; they cover different sockets. Keepalive probes
+  # fail a connection that was idle when the server went. userTimeout fails one
+  # that had already sent something, which keepalives never look at. Raise them
+  # on a lossy network, where a brief stall would otherwise cost good
+  # connections. Seconds; 0 disables either. Linux only — a developer's macOS
+  # applies what it can and says at startup what it could not.
+  tcp:
+    keepaliveIdle: 10
+    keepaliveInterval: 5
+    keepaliveCount: 3
+    userTimeout: 30
+
   # Postgres kills a switch-core connection that sits inside an open
   # transaction without executing anything for longer than this (e.g. "15s"),
   # so a leaked checkout becomes a loud, attributable error instead of a slot
@@ -333,6 +519,16 @@ postgresql:
   # in staging first. Migrations are unaffected; Alembic does not read it.
   idleInTransactionSessionTimeout: ""
 
+  # How long a migration waits for a lock before failing (e.g. "10s"; "0" waits
+  # forever). Migrations are DDL, so they ask for ACCESS EXCLUSIVE on tables the
+  # release is still serving from, and that request queues behind whatever
+  # transaction holds the table — with every reader arriving after it queueing
+  # behind the request. Waiting therefore does not just delay the upgrade, it
+  # stalls the deployment beside it. Failing instead leaves the old schema up
+  # and the release un-applied, which is the outcome worth retrying. Raise it
+  # for a migration known to rewrite a large table while traffic is on it.
+  migrationLockTimeout: "10s"
+
   # Password source. By default the password is read from the chart-managed
   # Secret (secrets.postgresPassword). To source it from a pre-existing Secret
   # instead (e.g. synced by external-secrets / sealed-secrets), set
@@ -340,6 +536,87 @@ postgresql:
   # required and no POSTGRES_PASSWORD is written into the chart Secret.
   existingSecret: ""
   existingSecretKey: POSTGRES_PASSWORD
+
+  # Schema owner credentials — the account with DDL and grant privileges, as
+  # distinct from DB_USER above (or postgresql.external.username for
+  # mode: existing), which name the RUNTIME role every request actually
+  # authenticates as and which the row-level-security policies apply to.
+  # switch-core uses the owner connection for exactly two things at boot, and
+  # never to serve a request: applying Alembic migrations, and re-issuing the
+  # runtime role's grants immediately afterwards, so a table a migration just
+  # added is usable by the role that is about to need it.
+  #
+  # mode: managed defaults this to the bootstrapped "postgres" superuser (the
+  # same account POSTGRES_USER creates on the StatefulSet below) whenever
+  # owner.username is left empty, because that account already exists in
+  # every managed install and its password is already the one this chart
+  # tracks as secrets.postgresPassword — there is nothing new to configure.
+  # Set owner.username only to point a managed deployment's migrations at some
+  # other DDL-capable role instead.
+  #
+  # mode: existing has no such account to default to — the chart has no
+  # visibility into what the external database's superuser is called — so
+  # owner.username stays genuinely empty there until you set it. That does NOT
+  # mean boot skips migrations: alembic upgrade head still runs, over whatever
+  # DB_USER resolves to (see migrations/env.py's fallback), and for a
+  # restricted runtime role any migration it actually has to apply fails with a
+  # permissions error.
+  #
+  # Note what that does not cover, because it is the trap here. A boot with
+  # nothing pending never issues a statement the restricted role lacks rights
+  # for, so it succeeds — and so does the isolation self-check, which asks
+  # about the connection rather than about who can migrate. An existing-mode
+  # deployment with a restricted DB_USER and no owner therefore comes up
+  # perfectly on the release that moved it there, and fails at boot on the
+  # next release that carries a migration. Set owner.username at the same time
+  # you repoint external.username, not afterwards.
+  #
+  # Setting it also decides what Mattermost connects as. In existing mode the
+  # chart has one username value for both roles, so Mattermost follows
+  # external.username unless an owner is configured — onto the restricted role,
+  # which has no rights in the "mattermost" database and cannot create or
+  # migrate its schema. With owner.username set, Mattermost uses the owner and
+  # switch-core alone uses the restricted role. See switch.mattermostDbUser in
+  # templates/_helpers.tpl.
+  #
+  # mode: managed can create the runtime role itself (see
+  # postgresql.managed.runtimeUsername, templates/postgresql/configmap-init.yaml
+  # for fresh installs and templates/switch-core/create-runtime-role-job.yaml
+  # for an upgrade of a deployment that predates it) precisely because it owns
+  # the Postgres it points at. mode: existing does not, and cannot: the chart
+  # has no way to run CREATE ROLE against a database it does not manage, so
+  # create the role out of band before pointing a deployment at it —
+  # docs/old/rds-migration.md has the exact SQL for an RDS master user.
+  owner:
+    username: ""
+    # Password source, mirroring existingSecret/existingSecretKey above. Only
+    # consulted when owner.username is set; the managed default above reads
+    # its password from wherever secrets.postgresPassword does instead.
+    existingSecret: ""
+    existingSecretKey: DB_OWNER_PASSWORD
+
+  # Refuse to serve when the runtime connection (DB_USER) is not actually
+  # subject to row-level security — a superuser, a BYPASSRLS role, or the
+  # owner of the policied tables. On by default in both modes, matching
+  # switch-core's own default, because the failure it guards against is
+  # silent: a deployment that believes it is isolating tenants and is not
+  # looks identical to one that is, right up until a second tenant reads the
+  # first's rooms.
+  #
+  # mode: managed creates DB_USER's role itself — see
+  # postgresql.managed.runtimeUsername above and the owner comment's
+  # explanation of why managed mode can do this and existing mode cannot — so
+  # the default install already has a restricted role for this check to pass
+  # against, and there is no reason to relax it there.
+  #
+  # mode: existing is the case this flag exists for. The chart cannot run
+  # CREATE ROLE against a database it does not manage, so a fresh
+  # existing-mode deployment, or one upgrading before its operator has run the
+  # CREATE ROLE in docs/old/rds-migration.md, has no restricted role yet. Set
+  # this false until that role exists; switch-core then logs an error on every
+  # boot instead of refusing to serve, as the visible reminder that tenant
+  # isolation is not active yet.
+  requireRestrictedRole: true
 
   # ── mode: existing ──────────────────────────────────────────────────────────
   # Only used when mode=existing. The `switch` and `mattermost` databases and
@@ -363,6 +640,27 @@ postgresql:
       memory: 256Mi
     limits:
       memory: 512Mi
+
+  managed:
+    # DB_USER for mode: managed — the restricted role this chart creates for
+    # switch-core to serve requests as, so the row-level-security policies
+    # apply to the connection actually handling traffic rather than to the
+    # bootstrapped superuser (see the postgresql.owner and requireRestrictedRole
+    # comments above for the full picture). Created on a fresh install by
+    # templates/postgresql/configmap-init.yaml and, for an upgrade of a
+    # deployment that predates it, by the create-runtime-role pre-upgrade hook.
+    #
+    # Its password is deliberately the bootstrapped superuser's own —
+    # secrets.postgresPassword, or whatever postgresql.existingSecret resolves
+    # to — rather than a password of its own. That adds no new required value,
+    # keeps working unmodified with postgresql.existingSecret, and exposes
+    # nothing new: this pod already holds that password as DB_OWNER_PASSWORD.
+    # The point of splitting DB_USER from the superuser is that the
+    # row-level-security policies apply to the connection serving requests,
+    # not to compartmentalise passwords between two accounts that already
+    # trust each other — so change the username here if you want, but there is
+    # no separate password field to set alongside it.
+    runtimeUsername: switch_app
 
   # Postgres server parameters, passed as `-c name=value`. Each client
   # connection is a backend process costing several MB of non-reclaimable

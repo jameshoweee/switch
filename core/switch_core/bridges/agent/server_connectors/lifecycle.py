@@ -14,13 +14,29 @@ from switch_core.bridges.agent.server_connectors.base import (
 from switch_core.bridges.agent.server_connectors.core import ConnectorCore
 from switch_core.crypto import decrypt_token, encrypt_token
 from switch_core.db.models import ApiKey, ServerConnector
+from switch_core.db.session_scope import tenant_session
 from switch_core.db.stores.api_key_store import ApiKeyStore
 from switch_core.db.stores.server_connector_store import ServerConnectorStore
+from switch_core.db.tenant_lookup import all_tenant_ids, tenant_of_server_connector
+from switch_core.telemetry import TelemetryService, emit_safely
 
 logger = logging.getLogger(__name__)
 
 
+def _connector_kind(connector_type: str) -> str:
+    """A connector type as the catalogue spells it.
+
+    Registered types are a runtime registry rather than a fixed list, so only
+    the one Switch ships is named and anything else reports `other`.
+    """
+    return connector_type if connector_type == "opencode" else "other"
+
+
 class ServerSideConnectorLifecycleService:
+    # Class-level default, as elsewhere: a test may build this without
+    # `__init__`, and `emit_safely` treats None as "report nothing".
+    _telemetry: TelemetryService | None = None
+
     def __init__(
         self,
         *,
@@ -28,17 +44,23 @@ class ServerSideConnectorLifecycleService:
         api_key_store: ApiKeyStore,
         protocol: ProtocolService,
         session_factory: async_sessionmaker[AsyncSession],
+        telemetry: TelemetryService | None = None,
         encryption_secret: str,
     ) -> None:
         self._connector_store = connector_store
         self._api_key_store = api_key_store
         self._protocol = protocol
         self._session_factory = session_factory
+        self._telemetry = telemetry
         self._encryption_secret = encryption_secret
 
         self._connector_registry: dict[str, type[ServerSideConnector]] = {}
         self._config_registry: dict[str, type[ServerSideConnectorConfig]] = {}
         self._cores: dict[str, ConnectorCore] = {}
+        # What this process means to be running. `_cores` alone cannot answer
+        # "is anything missing": a connector that failed to start never
+        # entered it, and `start_all` logs each failure and steps over it.
+        self._expected: set[str] = set()
 
     def register_connector_type(
         self,
@@ -50,11 +72,32 @@ class ServerSideConnectorLifecycleService:
         self._config_registry[type_name] = config_cls
 
     async def start_all(self) -> None:
-        async with self._session_factory() as session:
-            connectors = await self._connector_store.get_active(session)
+        # Every tenant's active connectors, one tenant at a time — same
+        # reasoning and same history as
+        # CollaborationBridgeLifecycleService.start_all, and worse here: this
+        # one is launched by a bare `create_task` in the lifespan, so when the
+        # unscoped read it replaces began returning nothing under the runtime
+        # role, no connector started and nothing said so at any log level.
+        #
+        # Nothing is bound around `start`: it reads the connector's own row
+        # and hands that row's tenant to the core, which binds it per unit of
+        # work rather than once for the poll loop's life.
+        connectors: list[ServerConnector] = []
+        for tenant_id in await all_tenant_ids(self._session_factory):
+            async with tenant_session(self._session_factory, tenant_id) as session:
+                # Filtered on the row's own tenant, not left to the policy: on an
+                # owner connection no policy narrows this read, and the fan-out
+                # would act on every tenant's rows once per tenant. See
+                # `db/tenant_lookup.py`, "a fan-out ... filters what it reads back".
+                connectors.extend(
+                    record
+                    for record in await self._connector_store.get_active(session)
+                    if record.tenant_id == tenant_id
+                )
 
         logger.info("Starting %d server-side connectors", len(connectors))
         for record in connectors:
+            self._expected.add(record.id)
             try:
                 await self.start(record.id)
             except Exception:
@@ -85,6 +128,11 @@ class ServerSideConnectorLifecycleService:
             type="registration",
         )
 
+        # Reached only from `POST /connectors`, so the session inherits the
+        # tenant the auth dependency bound and both rows below land in the
+        # operator's own — which is the answer, since it is their connector.
+        # `start` then re-reads the row unscoped to learn that tenant back,
+        # rather than assuming this one is still bound by then.
         async with self._session_factory() as session:
             await self._api_key_store.create(session, reg_key)
 
@@ -100,6 +148,12 @@ class ServerSideConnectorLifecycleService:
 
         await self.start(record.id)
 
+        emit_safely(
+            self._telemetry,
+            "server_connector_registered",
+            {"connector_kind": _connector_kind(connector_type)},
+        )
+
         logger.info(
             "Registered server-side connector %s (%s): %s (owner: %s)",
             record.id,
@@ -110,7 +164,20 @@ class ServerSideConnectorLifecycleService:
         return record
 
     async def start(self, connector_id: str) -> None:
-        async with self._session_factory() as session:
+        # The exemption answers which tenant this connector is in
+        # (`db/tenant_lookup.py`); the two rows are then read scoped to it.
+        # Reached both from boot with nothing bound and from an HTTP request
+        # whose tenant is the caller's, not necessarily the connector's, so
+        # the tenant is derived here rather than inherited either way. The
+        # registration key is read in the same scoped session because
+        # `server_connectors` carries a composite foreign key on
+        # `(tenant_id, api_key_id)` — it cannot be another tenant's row.
+        tenant_id = await tenant_of_server_connector(
+            self._session_factory, connector_id
+        )
+        if tenant_id is None:
+            raise ValueError(f"Connector not found: {connector_id}")
+        async with tenant_session(self._session_factory, tenant_id) as session:
             record = await self._connector_store.get(session, connector_id)
             if record is None:
                 raise ValueError(f"Connector not found: {connector_id}")
@@ -132,6 +199,7 @@ class ServerSideConnectorLifecycleService:
 
         core = ConnectorCore(
             connector_id=connector_id,
+            connector_tenant_id=record.tenant_id,
             connector_type=record.type,
             connector=connector,
             registration_token=registration_token,
@@ -139,12 +207,26 @@ class ServerSideConnectorLifecycleService:
         )
         await core.start()
         self._cores[connector_id] = core
+        self._expected.add(connector_id)
 
     async def stop(self, connector_id: str) -> None:
+        self._expected.discard(connector_id)
         core = self._cores.pop(connector_id, None)
         if core is None:
             return
         await core.stop()
+
+    def expected_count(self) -> int:
+        """Connectors this process means to be running."""
+        return len(self._expected)
+
+    def running_count(self) -> int:
+        """Of those, how many actually are.
+
+        Short of `expected_count` is an agent host that is not there, which is
+        otherwise only a line in the boot log.
+        """
+        return sum(1 for connector_id in self._expected if connector_id in self._cores)
 
     async def stop_all(self) -> None:
         logger.info("Stopping all %d server-side connectors", len(self._cores))
@@ -152,6 +234,27 @@ class ServerSideConnectorLifecycleService:
             await self.stop(connector_id)
 
     async def remove(self, connector_id: str) -> None:
+        """Delete a connector: its agents, its running core, and its row.
+
+        Scoped to the caller, and checked before anything is torn down. The
+        session inherits the tenant the request bound (`gateway/auth.py`), so
+        a connector belonging to another tenant is simply not there — but
+        `_cores` is a process-wide registry with every tenant's connectors in
+        it, so tearing down first and deleting second let a caller from the
+        wrong tenant stop another tenant's connector and delete its agents,
+        then match zero rows and report success. The read below is what makes
+        the tenant check happen before the damage rather than after it.
+
+        `ServerConnectorStore.delete` raises when it matches nothing, so the
+        window between the two — the row deleted underneath us — surfaces as
+        an error rather than as a second false success.
+        """
+        async with self._session_factory() as session:
+            existing = await self._connector_store.get(session, connector_id)
+            kind = existing.type if existing is not None else "other"
+            if existing is None:
+                raise ValueError(f"Connector not found: {connector_id}")
+
         core = self._cores.get(connector_id)
         if core is not None:
             await core.delete_agents()
@@ -162,6 +265,11 @@ class ServerSideConnectorLifecycleService:
             await self._connector_store.delete(session, connector_id)
             await session.commit()
 
+        emit_safely(
+            self._telemetry,
+            "server_connector_removed",
+            {"connector_kind": _connector_kind(kind)},
+        )
         logger.info("Removed server-side connector %s", connector_id)
 
     def get_registered_types(self) -> list[str]:

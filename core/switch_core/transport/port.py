@@ -41,6 +41,12 @@ class TransportHandlers:
     on_member_event: Handler | None = None
     on_custom_event: Handler | None = None
     on_invite: Handler | None = None
+    # The other half of `on_invite`: the client has been taken out of a room
+    # while it was running. The transport has already stopped reading the room
+    # by the time this fires; what it is for is everything downstream that is
+    # still holding the room's events — an agent's event buffer, a connection
+    # covering it — which the transport knows nothing about.
+    on_removed: Handler | None = None
 
 
 @runtime_checkable

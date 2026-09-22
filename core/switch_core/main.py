@@ -10,10 +10,18 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 import uvicorn
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.pool import NullPool
 
 from switch_core.bridges.agent.app import create_agent_bridge_app
 from switch_core.bridges.agent.protocol.connections import (
@@ -42,6 +50,11 @@ from switch_core.bridges.collaboration.discord.adapter import (
     DiscordAdapter,
     DiscordConnectionConfig,
 )
+from switch_core.bridges.collaboration.install import MessagingInstallerRegistry
+from switch_core.bridges.collaboration.install_routes import (
+    create_messaging_install_router,
+)
+from switch_core.bridges.collaboration.install_service import MessagingInstallService
 from switch_core.bridges.collaboration.lifecycle_service import (
     CollaborationBridgeLifecycleService,
 )
@@ -53,6 +66,7 @@ from switch_core.bridges.collaboration.slack.adapter import (
     SlackAdapter,
     SlackConnectionConfig,
 )
+from switch_core.bridges.collaboration.slack.install import SlackAppInstaller
 from switch_core.bridges.collaboration.teams.adapter import (
     TeamsAdapter,
     TeamsConnectionConfig,
@@ -69,12 +83,19 @@ from switch_core.clients.client_factory import ClientFactory
 from switch_core.clients.client_lifecycle_service import ClientLifecycleService
 from switch_core.config import SwitchConfig
 from switch_core.crypto import encrypt_token
+from switch_core.db.boot_lock import boot_lock
 from switch_core.db.engine import (
     create_engine_from_config,
     create_session_factory,
     create_unpooled_engine,
 )
-from switch_core.db.models import ApiKey, User
+from switch_core.db.models import TENANT_ZERO_ID, ApiKey, User
+from switch_core.db.runtime_role import (
+    RuntimeRoleError,
+    grant_runtime_role,
+    verify_restricted_role,
+)
+from switch_core.db.session_scope import tenant_session
 from switch_core.db.stores.agent_session_store import AgentSessionStore
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.api_key_store import ApiKeyStore
@@ -83,8 +104,11 @@ from switch_core.db.stores.client_store import ClientStore
 from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
 from switch_core.db.stores.document_store import DocumentStore
 from switch_core.db.stores.external_user_store import ExternalUserStore
+from switch_core.db.stores.invitation_store import InvitationStore
 from switch_core.db.stores.media_store import MediaStore
 from switch_core.db.stores.message_store import MessageStore
+from switch_core.db.stores.messaging_event_store import MessagingEventReceiptStore
+from switch_core.db.stores.messaging_install_store import MessagingInstallStore
 from switch_core.db.stores.package_store import PackageStore
 from switch_core.db.stores.reference_store import ReferenceStore
 from switch_core.db.stores.reference_type_store import ReferenceTypeStore
@@ -93,14 +117,30 @@ from switch_core.db.stores.room_link_store import RoomLinkStore
 from switch_core.db.stores.room_role_store import RoomRoleStore
 from switch_core.db.stores.room_store import RoomStore
 from switch_core.db.stores.server_connector_store import ServerConnectorStore
+from switch_core.db.stores.session_request_post_store import SessionRequestPostStore
 from switch_core.db.stores.task_store import TaskStore
+from switch_core.db.stores.template_store import TemplateStore
+from switch_core.db.stores.tenant_store import TenantStore
 from switch_core.db.stores.user_store import UserStore
+from switch_core.db.tenant_lookup import all_tenant_ids
 from switch_core.gateway.app import create_gateway_app
 from switch_core.gateway.auth import hash_password
+from switch_core.logging_config import configure_logging
 from switch_core.messages.notify import MessageListener
+from switch_core.observability.bootstrap import (
+    Observability,
+    RuntimeProbes,
+    start_observability,
+)
+from switch_core.observability.pool import pool_stats
+from switch_core.observability.runtime import EventLoopLag
 from switch_core.provisioning import Provisioning
 from switch_core.provisioning.postgres import PostgresProvisioning
 from switch_core.room_service import RoomService
+from switch_core.telemetry.reporter import SnapshotReporter
+from switch_core.telemetry.service import TelemetryService
+from switch_core.telemetry.setup import build_telemetry
+from switch_core.tenant_context import no_tenant
 from switch_core.transport.ephemeral import EphemeralBus
 from switch_core.transport.invites import InviteBus
 from switch_core.version import switch_core_version
@@ -117,17 +157,27 @@ _RUNTIME_STATE_SWEEP_INTERVAL = 5.0
 # promptly rather than at the next unrelated request.
 _CONNECTION_SWEEP_INTERVAL = 2.0
 
+# The window the lifespan's teardown runs in before the process is killed
+# regardless. Anything with a deadline of its own must fit inside it — see
+# `observability.logs.SHUTDOWN_FLUSH_SECONDS`.
+_FORCED_EXIT_GRACE_SECONDS = 3.0
+
 
 async def _runtime_state_sweep_loop(protocol: ProtocolService) -> None:
-    while True:
-        await asyncio.sleep(_RUNTIME_STATE_SWEEP_INTERVAL)
-        try:
-            await protocol.sweep_runtime_states()
-        except Exception:
-            logger.exception("Runtime-state sweep failed")
+    # `no_tenant` for the reason every other long-lived task does it: a task
+    # keeps the context of whoever created it, and nothing in here may depend
+    # on that. Boot binds nothing today, so this changes no behaviour — it
+    # removes the dependency on boot continuing not to.
+    with no_tenant():
+        while True:
+            await asyncio.sleep(_RUNTIME_STATE_SWEEP_INTERVAL)
+            try:
+                await protocol.sweep_runtime_states()
+            except Exception:
+                logger.exception("Runtime-state sweep failed")
 
 
-async def _connection_sweep_loop(protocol: ProtocolService) -> None:
+async def _connection_sweep_loop(protocol: ProtocolService, lag: EventLoopLag) -> None:
     """Expire connections whose client has stopped beating.
 
     Skips a round after the event loop has been blocked. A stall stops us
@@ -136,11 +186,16 @@ async def _connection_sweep_loop(protocol: ProtocolService) -> None:
     leases, then every client reconnects together, which is a worse stall. The
     clients were never given the chance to beat, so the honest reading is "we
     were not listening", not "they went away".
+
+    Its short fixed interval also makes it the most sensitive witness to the
+    loop being blocked, so every round's oversleep is reported — not only the
+    ones large enough to skip a sweep.
     """
     while True:
         started = time.monotonic()
         await asyncio.sleep(_CONNECTION_SWEEP_INTERVAL)
         overslept = (time.monotonic() - started) - _CONNECTION_SWEEP_INTERVAL
+        lag.record(overslept)
         if overslept > HEARTBEAT_TTL_SECONDS / 2:
             logger.warning(
                 "Connection sweep skipped: the event loop was blocked for %.1fs, "
@@ -163,7 +218,44 @@ async def _connection_sweep_loop(protocol: ProtocolService) -> None:
             logger.exception("Connection sweep failed")
 
 
-logging.getLogger("httpx").setLevel(logging.WARNING)
+# The innermost of three nested budgets: under
+# `observability.logs.SHUTDOWN_FLUSH_SECONDS`, itself under
+# `_FORCED_EXIT_GRACE_SECONDS`.
+_TELEMETRY_DRAIN_SECONDS = 1.0
+
+
+async def _drain_telemetry(
+    telemetry: TelemetryService, http_client: httpx.AsyncClient | None
+) -> None:
+    """Let in-flight product events finish, then close their client.
+
+    Never raises and never overruns: a relay that stopped answering must not
+    hold the process past the point where it is killed.
+    """
+    try:
+        async with asyncio.timeout(_TELEMETRY_DRAIN_SECONDS):
+            await telemetry.aclose()
+    except TimeoutError:
+        logger.warning(
+            "Gave up waiting for in-flight telemetry after %.1fs; those events "
+            "are lost.",
+            _TELEMETRY_DRAIN_SECONDS,
+        )
+    except Exception:
+        logger.warning("Telemetry shutdown failed; continuing.", exc_info=True)
+    if http_client is not None:
+        try:
+            await http_client.aclose()
+        except Exception:
+            logger.warning("Telemetry HTTP client did not close.", exc_info=True)
+
+
+async def _snapshot_loop(reporter: SnapshotReporter) -> None:
+    # `no_tenant` for the reason every other long-lived task does it: the
+    # snapshot binds each tenant in turn as it counts, and must not inherit
+    # whichever one happened to be bound when the task was created.
+    with no_tenant():
+        await reporter.run_forever()
 
 
 class _QuietPollFilter(logging.Filter):
@@ -181,10 +273,63 @@ class _QuietPollFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_QuietPollFilter())
 
 
-async def run() -> None:
-    config = SwitchConfig()
+async def _prepare_database(config: SwitchConfig) -> None:
+    """Re-issue the runtime role's grants, on the owner's connection.
+
+    Runs after `alembic upgrade head` and before anything opens the runtime
+    engine, so a table the migration has just added is granted before the role
+    that needs it connects. Skipped where no owner is configured: that is a
+    deployment whose migrations and grants are somebody else's job, and
+    inventing an owner connection for it would be worse than doing nothing.
+    """
+    owner_url = config.owner_database_url
+    if owner_url is None:
+        return
+    owner_engine = create_async_engine(
+        owner_url, poolclass=NullPool, connect_args=config.db_connect_args
+    )
+    try:
+        async with owner_engine.begin() as connection:
+            await grant_runtime_role(connection, config.db_user)
+    finally:
+        await owner_engine.dispose()
+    logger.info(
+        "Granted the runtime role %s access to the schema owned by %s",
+        config.db_user,
+        config.db_owner_user,
+    )
+
+
+async def _check_tenant_isolation(config: SwitchConfig, engine: AsyncEngine) -> None:
+    """Refuse to serve on a connection the policies do not apply to.
+
+    Before anything else touches the database, because the first thing that
+    does is the admin seeding, and a deployment that is not isolating tenants
+    should not get as far as writing a row.
+    """
+    try:
+        await verify_restricted_role(engine)
+    except RuntimeRoleError as exc:
+        if config.db_require_restricted_role:
+            raise
+        logger.error(
+            "Tenant isolation is NOT in force on this deployment: %s "
+            "Continuing only because DB_REQUIRE_RESTRICTED_ROLE is false. "
+            "Every row-level-security policy in this schema is inert, and any "
+            "second tenant onboarded here can read the first's data.",
+            exc,
+        )
+
+
+async def run(config: SwitchConfig) -> None:
     # ── Database ─────────────────────────────────────────────────────────────
+    # The migration and the runtime role's grant re-issue already ran, under
+    # Switch's boot-time advisory lock, before this coroutine was ever started
+    # — see `main._migrate_and_grant`, which `main()` awaits first. Both use
+    # the schema owner's connection where one is configured, and neither
+    # belongs on the pooled application engine built below.
     engine = create_engine_from_config(config)
+    await _check_tenant_isolation(config, engine)
     session_factory = create_session_factory(engine)
     # Its connection is held rather than borrowed, so it builds its own outside
     # the pool. Nothing subscribes yet; it starts with the server so that the
@@ -205,8 +350,11 @@ async def run() -> None:
     bridge_store = CollaborationBridgeStore()
     external_user_store = ExternalUserStore()
     bridge_message_map_store = BridgeMessageMapStore()
+    session_request_post_store = SessionRequestPostStore()
     user_store = UserStore()
     api_key_store = ApiKeyStore()
+    invitation_store = InvitationStore()
+    tenant_store = TenantStore()
     reference_store = ReferenceStore()
     reference_type_store = ReferenceTypeStore()
     document_store = DocumentStore()
@@ -216,16 +364,33 @@ async def run() -> None:
     room_role_store = RoomRoleStore()
     message_store = MessageStore()
     media_store = MediaStore()
+    template_store = TemplateStore()
 
     # ── Seed admin user + agent-registration bootstrap key ──────────────────
-    await _seed_admin_user(session_factory, user_store, config)
-    await _seed_agent_registration_bootstrap_key(
-        session_factory, user_store, api_key_store, agent_store, config
-    )
+    # A second acquisition of the boot lock, distinct from the one around the
+    # migration in `main._migrate_and_grant`: nothing between the two needs
+    # another replica kept out, so there is nothing to gain from holding one
+    # lock across the whole of boot instead of two narrower ones. This one
+    # cannot be a transaction-scoped `pg_advisory_xact_lock` the way a single
+    # migration transaction could be, though — the seeding below reads its own
+    # state and writes it back across several separate sessions (see
+    # `_seed_agent_registration_bootstrap_key`'s docstring), so only a
+    # session-level lock, held for the whole span, actually serialises it.
+    async with boot_lock(config):
+        await _seed_admin_user(session_factory, user_store, config)
+        await _seed_agent_registration_bootstrap_key(
+            session_factory, user_store, api_key_store, agent_store, config
+        )
 
     # ── Event queue + request trackers ───────────────────────────────────────
     event_buffer = EventBuffer()
     connector_store = ServerConnectorStore()
+
+    # ── Product telemetry ────────────────────────────────────────────────────
+    # Before the services that report through it, switched on or not.
+    telemetry, installed_at, telemetry_http = await build_telemetry(
+        config, session_factory, switch_core_version()
+    )
 
     # ── Resource service ─────────────────────────────────────────────────────
     resource_service = ResourceService(
@@ -235,9 +400,27 @@ async def run() -> None:
         package_store=package_store,
         room_link_store=room_link_store,
         session_factory=session_factory,
+        telemetry=telemetry,
     )
-    async with session_factory() as session:
-        await resource_service.log_builtin_shadowing(session)
+    # Once per tenant, not once for the deployment: `reference_types` is
+    # scoped, so "every stored type a built-in shadows" is a question asked of
+    # one tenant at a time. Which tenants there are is the one read that
+    # cannot be scoped to any of them, so it goes through the exemption
+    # (`db/tenant_lookup.py`) rather than through a session.
+    #
+    # No `row.tenant_id == tenant_id` filter here, unlike the fan-outs in
+    # `ClientLifecycleService`: `ReferenceTypeStore.list_all` names `tenant_id
+    # = require_tenant_id()` in its own query rather than leaning on the
+    # policy for it (it is the one store that has to, per `db/tenant_lookup.py`
+    # and `reference_type_store.py` — `reference_types` has no `id` column of
+    # its own to filter by otherwise). That WHERE clause narrows correctly on
+    # an owner connection too, so each pass through this loop already sees
+    # only the tenant it just bound; a row-by-row filter on top of it would
+    # compare a value against one it can never disagree with.
+    tenant_ids = await all_tenant_ids(session_factory)
+    for tenant_id in tenant_ids:
+        async with tenant_session(session_factory, tenant_id) as session:
+            await resource_service.log_builtin_shadowing(session)
 
     # ── Provisioning ─────────────────────────────────────────────────────────
     matrix_admin: Provisioning = PostgresProvisioning(
@@ -288,6 +471,7 @@ async def run() -> None:
     client_lifecycle = ClientLifecycleService(
         matrix_admin=matrix_admin,
         client_store=client_store,
+        tenant_store=tenant_store,
         client_factory=client_factory,
         session_factory=session_factory,
         config=config,
@@ -298,6 +482,7 @@ async def run() -> None:
         bridge_store=bridge_store,
         external_user_store=external_user_store,
         bridge_message_map_store=bridge_message_map_store,
+        session_request_post_store=session_request_post_store,
         room_store=room_store,
         agent_store=agent_store,
         client_store=client_store,
@@ -307,6 +492,7 @@ async def run() -> None:
         session_factory=session_factory,
         config=config,
         client_factory=client_factory,
+        telemetry=telemetry,
     )
 
     # ── Room service ─────────────────────────────────────────────────────────
@@ -319,6 +505,7 @@ async def run() -> None:
         collab_bridge_store=bridge_store,
         resource_service=resource_service,
         session_factory=session_factory,
+        telemetry=telemetry,
     )
     collab_lifecycle._room_service = room_service
 
@@ -356,7 +543,12 @@ async def run() -> None:
         session_factory=session_factory,
         config=config,
         connections=connections,
+        telemetry=telemetry,
     )
+    # Every close reports, whichever of the five paths did it — and only for a
+    # connection the handler saw start.
+    connections.set_close_listener(protocol.sessions.on_close)
+
     # ── Server-side connector lifecycle ─────────────────────────────────────
     connector_lifecycle = ServerSideConnectorLifecycleService(
         connector_store=connector_store,
@@ -364,10 +556,42 @@ async def run() -> None:
         protocol=protocol,
         session_factory=session_factory,
         encryption_secret=config.jwt_secret_key,
+        telemetry=telemetry,
     )
     connector_lifecycle.register_connector_type(
         "opencode", OpenCodeConnector, OpenCodeConnectionConfig
     )
+
+    # ── Messaging app installs ──────────────────────────────────────────────
+    # Registration is the feature flag. An installer exists for a platform when
+    # this deployment holds that platform's app credentials, and the whole
+    # install surface refuses when none does — a deployment that registered no
+    # app cannot half-offer the button. Config validation has already required
+    # the three Slack values all together and a public origin with them.
+    installers = MessagingInstallerRegistry()
+    if config.slack_app_client_id:
+        assert config.slack_app_client_secret is not None
+        assert config.slack_app_signing_secret is not None
+        installers.register(
+            SlackAppInstaller(
+                client_id=config.slack_app_client_id,
+                client_secret=config.slack_app_client_secret,
+                signing_secret=config.slack_app_signing_secret,
+            )
+        )
+
+    install_service: MessagingInstallService | None = None
+    if installers.platforms():
+        assert config.messaging_public_url is not None
+        install_service = MessagingInstallService(
+            session_factory=session_factory,
+            store=MessagingInstallStore(),
+            receipts=MessagingEventReceiptStore(),
+            installers=installers,
+            lifecycle=collab_lifecycle,
+            public_origin=config.messaging_public_url,
+            secret=config.jwt_secret_key,
+        )
 
     # ── Gateway app ───────────────────────────────────────────────────────────
     gateway_app = create_gateway_app(
@@ -385,8 +609,11 @@ async def run() -> None:
         user_store=user_store,
         external_user_store=external_user_store,
         api_key_store=api_key_store,
+        invitation_store=invitation_store,
+        template_store=template_store,
         resource_service=resource_service,
         protocol=protocol,
+        install_service=install_service,
         config=config,
     )
 
@@ -403,26 +630,85 @@ async def run() -> None:
         "telegram", TelegramAdapter, TelegramConnectionConfig
     )
 
-    # Health check mounted on the agent bridge app
+    # Liveness, and cheap on purpose: the gateway Deployment and the setup Job
+    # wait on it at boot, so anything it checked would become a boot-ordering
+    # dependency for them. Readiness is /health/ready below.
     @agent_bridge_app.get("/health")
     async def health_check() -> JSONResponse:
         return JSONResponse({"status": "ok"})
+
+    # Set by the lifespan; before that the honest answer is "no".
+    observability: Observability | None = None
+
+    @agent_bridge_app.get("/health/ready")
+    async def readiness_check() -> JSONResponse:
+        if observability is None:
+            return JSONResponse(
+                {"status": "not ready", "checks": {"startup": {"healthy": False}}},
+                status_code=503,
+            )
+        report = observability.monitor.current()
+        return JSONResponse(
+            report.as_response(), status_code=200 if report.ready else 503
+        )
+
+    # Mounted on the agent-bridge app, not inside /gateway: this is the leg a
+    # platform and a customer's browser reach, and /gateway is neither routed
+    # here from outside nor reachable without a cookie they do not have.
+    if install_service is not None:
+        agent_bridge_app.include_router(
+            create_messaging_install_router(install_service),
+            tags=["messaging-installs"],
+        )
 
     agent_bridge_app.mount("/gateway", gateway_app)
 
     # ── Ensure system clients exist ─────────────────────────────────────────
     await client_lifecycle.ensure_system_client("admin")
 
+    probes = RuntimeProbes(
+        listener_connected=message_listener.connected.is_set,
+        bridges_running=collab_lifecycle.running_count,
+        bridges_configured=collab_lifecycle.expected_count,
+        clients_running=client_lifecycle.running_count,
+        connectors_running=connector_lifecycle.running_count,
+        connectors_configured=connector_lifecycle.expected_count,
+        agents_connected=lambda: len(connections.live_agent_ids()),
+        pool_stats=lambda: pool_stats(engine),
+    )
+
     # ── Lifespan: start server-side connectors once HTTP is serving ────────
     original_lifespan = agent_bridge_app.router.lifespan_context
 
+    snapshot_reporter = SnapshotReporter(
+        telemetry=telemetry,
+        session_factory=session_factory,
+        interval_hours=config.telemetry_snapshot_interval_hours,
+        installed_at=installed_at,
+        live_session_count=connections.live_connection_count,
+    )
+
     @asynccontextmanager
     async def lifespan(app: object) -> AsyncIterator[None]:
+        nonlocal observability
         async with original_lifespan(app):  # type: ignore[arg-type]
+            observability = start_observability(
+                config=config,
+                version=switch_core_version(),
+                session_factory=session_factory,
+                probes=probes,
+            )
             asyncio.create_task(connector_lifecycle.start_all())
             sweep_task = asyncio.create_task(_runtime_state_sweep_loop(protocol))
             connection_sweep_task = asyncio.create_task(
-                _connection_sweep_loop(protocol)
+                _connection_sweep_loop(protocol, observability.lag)
+            )
+            # Only when telemetry is on: the chart tells a customer that off
+            # means nothing is collected, and the fan-out is not free.
+            snapshot_task = (
+                asyncio.create_task(_snapshot_loop(snapshot_reporter))
+                if telemetry.enabled
+                else None
             )
             await message_listener.start()
             try:
@@ -430,7 +716,18 @@ async def run() -> None:
             finally:
                 sweep_task.cancel()
                 connection_sweep_task.cancel()
+                if snapshot_task is not None:
+                    snapshot_task.cancel()
                 await message_listener.stop()
+                # Before the operational flush, and bounded: the whole
+                # teardown runs inside `_FORCED_EXIT_GRACE_SECONDS` and a
+                # product event is the least valuable thing in it.
+                await protocol.sessions.aclose()
+                await _drain_telemetry(telemetry, telemetry_http)
+                await observability.aclose()
+                # So a probe during teardown gets a 503 rather than the last
+                # cached answer, which may still say ready.
+                observability = None
 
     agent_bridge_app.router.lifespan_context = lifespan  # type: ignore[assignment]
 
@@ -446,6 +743,10 @@ async def run() -> None:
     logger.info(
         "Switch is running on http://%s:%d", config.server_host, config.server_port
     )
+
+    telemetry.emit("deployment_started", tenant_count=len(tenant_ids))
+    # The funnel's first step, and only for a deployment with an install date.
+    await telemetry.emit_milestone("deployment_installed")
 
     server_config = uvicorn.Config(
         agent_bridge_app,
@@ -475,14 +776,40 @@ async def run() -> None:
 
 
 async def _seed_admin_user(
-    session_factory: object,
+    session_factory: async_sessionmaker[AsyncSession],
     user_store: UserStore,
     config: SwitchConfig,
 ) -> None:
-    async with session_factory() as session:  # type: ignore[operator]
+    # Tenant zero by name, not by fallback. The admin `User` row is global
+    # (db/models.py) and the lookup below spans every tenant either way, but
+    # `UserStore.create` also writes a `tenant_members` row, and which tenant
+    # the deployment's own admin joins is a decision this line makes rather
+    # than one a default makes for it. It is the same decision, and the same
+    # reasoning, as `gateway/oidc_routes.py` binding tenant zero around a
+    # just-in-time provisioned account: exactly one tenant exists, and signing
+    # up into a tenant of one's own is a later phase, whose change is here.
+    async with tenant_session(session_factory, TENANT_ZERO_ID) as session:
         existing = await user_store.get_by_email(session, config.gateway_admin_email)
         if existing is not None:
-            logger.info("Admin user already exists: %s", config.gateway_admin_email)
+            # Existing, but not necessarily whole. An account with no
+            # `tenant_members` row cannot sign in at all — `gateway/auth.py`
+            # refuses to guess a tenant and answers 403 — and until this ran,
+            # the only thing in the product that ever wrote a missing
+            # membership was an OIDC login, so a password account in that
+            # state was locked out with no way back in short of SQL. The
+            # migration backfilled every account that existed when it ran;
+            # this covers the ones that did not, and any whose membership is
+            # lost later.
+            if await user_store.ensure_membership(session, existing):
+                await session.commit()
+                logger.warning(
+                    "Admin user %s had no tenant membership and could not have "
+                    "signed in; joined it to tenant %s.",
+                    config.gateway_admin_email,
+                    TENANT_ZERO_ID,
+                )
+            else:
+                logger.info("Admin user already exists: %s", config.gateway_admin_email)
             return
 
         admin = User(
@@ -497,7 +824,7 @@ async def _seed_admin_user(
 
 
 async def _seed_agent_registration_bootstrap_key(
-    session_factory: object,
+    session_factory: async_sessionmaker[AsyncSession],
     user_store: UserStore,
     api_key_store: ApiKeyStore,
     agent_store: AgentStore,
@@ -522,30 +849,80 @@ async def _seed_agent_registration_bootstrap_key(
     already exists under the old one, which would collide on the unique
     ``key_hash`` and fail the whole boot.
     """
-    async with session_factory() as session:  # type: ignore[operator]
+    # This was one unscoped session, and it is the one place in the tree where
+    # "unscoped session" and "scoped write" met — the design doc named it as
+    # the path the runtime role would have to come back for. It has, and this
+    # is what it became: three phases, each scoped to the tenant it is
+    # actually acting in, and the only cross-tenant question left ("which
+    # tenants are there") answered by the exemption in `db/tenant_lookup.py`.
+    tenant_ids = await all_tenant_ids(session_factory)
+
+    # ── The two accounts, in tenant zero ────────────────────────────────────
+    # `users` is global, so the lookups need no tenant; `ensure_bootstrap_owner`
+    # writes a `tenant_members` row, which does. It named tenant zero before
+    # and still does — the deployment's own accounts belong to the tenant the
+    # migration created — but it now does so on a session that was bound
+    # *before* its transaction opened, which is what makes the write land at
+    # all: a `tenant_scope` entered inside an already-begun transaction changes
+    # nothing, because the `set_config` rides `after_begin`.
+    async with tenant_session(session_factory, TENANT_ZERO_ID) as session:
         admin = await user_store.get_by_email(session, config.gateway_admin_email)
         if admin is None:
             raise RuntimeError(
                 "Cannot seed agent-registration bootstrap key: admin user "
                 f"{config.gateway_admin_email} not found"
             )
+        admin_id = admin.id
         bootstrap_owner = await ensure_bootstrap_owner(session, user_store)
+        bootstrap_owner_id = bootstrap_owner.id
+        owner_metadata = dict(bootstrap_owner.metadata_ or {})
+        await session.commit()
 
-        admin_owned_agents = [
-            a for a in await agent_store.get_all(session) if a.owner_id == admin.id
-        ]
-        if admin_owned_agents:
-            logger.warning(
-                "%d agent(s) are owned by the admin user (%s) and carry "
-                "admin-equivalent authority over every room and resource in "
-                "this deployment, not just their own: %s. If any were "
-                "registered through AGENT_REGISTRATION_TOKEN, reassign or "
-                "re-register them under a non-admin owner.",
-                len(admin_owned_agents),
-                config.gateway_admin_email,
-                ", ".join(a.name for a in admin_owned_agents),
+    # ── The admin-owned-agent warning, over every tenant ────────────────────
+    # It has to see every tenant's agents or it under-reports exactly the case
+    # it exists to flag, and it now does so one tenant at a time. The names
+    # are collected rather than the rows: nothing here needs an `Agent` past
+    # the session that read it.
+    admin_owned_agents: list[str] = []
+    for tenant_id in tenant_ids:
+        async with tenant_session(session_factory, tenant_id) as session:
+            # Filtered on the row's own tenant as well as the owner: on an
+            # owner connection no policy narrows the read, and every tenant's
+            # agents would be counted once per tenant. See
+            # `db/tenant_lookup.py`.
+            admin_owned_agents.extend(
+                agent.name
+                for agent in await agent_store.get_all(session)
+                if agent.owner_id == admin_id and agent.tenant_id == tenant_id
             )
+    if admin_owned_agents:
+        logger.warning(
+            "%d agent(s) are owned by the admin user (%s) and carry "
+            "admin-equivalent authority over every room and resource in "
+            "this deployment, not just their own: %s. If any were "
+            "registered through AGENT_REGISTRATION_TOKEN, reassign or "
+            "re-register them under a non-admin owner.",
+            len(admin_owned_agents),
+            config.gateway_admin_email,
+            ", ".join(admin_owned_agents),
+        )
 
+    # ── The key itself, in the one tenant that holds it ─────────────────────
+    key_tenant_id = await _bootstrap_key_tenant(
+        session_factory, api_key_store, tenant_ids
+    )
+    # Retiring a stale legacy key is deployment-wide even though adopting one
+    # is not. The block below works in a single tenant, which is right for the
+    # key — it is one per deployment — and wrong for the sweep beside it: a
+    # legacy admin-owned registration row in some *other* tenant still
+    # authenticates and still registers agents with admin authority, which is
+    # the case that sweep exists to stop. It reads every tenant, one at a
+    # time, and hands back what it revoked so the owner's record below covers
+    # those hashes too.
+    retired_elsewhere = await _retire_legacy_keys_outside(
+        session_factory, api_key_store, tenant_ids, key_tenant_id
+    )
+    async with tenant_session(session_factory, key_tenant_id) as session:
         token_hash = hashlib.sha256(
             config.agent_registration_token.encode()
         ).hexdigest()
@@ -553,7 +930,16 @@ async def _seed_agent_registration_bootstrap_key(
             config.agent_registration_token, config.jwt_secret_key
         )
 
-        bootstrap_keys = await api_key_store.get_by_type(session, BOOTSTRAP_KEY_TYPE)
+        # Filtered on this tenant as well as on the type, for the same reason
+        # every other fan-out in this change is: `get_by_type` carries no
+        # tenant filter of its own, so on an owner connection it answers with
+        # every tenant's keys and this block would adopt or retire one that
+        # belongs to somebody else. See `db/tenant_lookup.py`.
+        bootstrap_keys = [
+            row
+            for row in await api_key_store.get_by_type(session, BOOTSTRAP_KEY_TYPE)
+            if row.tenant_id == key_tenant_id
+        ]
         if len(bootstrap_keys) > 1:
             raise RuntimeError(
                 f"Found {len(bootstrap_keys)} agent-registration bootstrap "
@@ -561,12 +947,8 @@ async def _seed_agent_registration_bootstrap_key(
             )
         bootstrap_key = bootstrap_keys[0] if bootstrap_keys else None
 
-        last_seeded_hash = (bootstrap_owner.metadata_ or {}).get(
-            BOOTSTRAP_LAST_SEEDED_HASH_META_KEY
-        )
-        raw_revoked_hashes = (bootstrap_owner.metadata_ or {}).get(
-            BOOTSTRAP_REVOKED_HASHES_META_KEY
-        )
+        last_seeded_hash = owner_metadata.get(BOOTSTRAP_LAST_SEEDED_HASH_META_KEY)
+        raw_revoked_hashes = owner_metadata.get(BOOTSTRAP_REVOKED_HASHES_META_KEY)
         if raw_revoked_hashes is not None and not isinstance(raw_revoked_hashes, list):
             raise RuntimeError(
                 f"{BOOTSTRAP_REVOKED_HASHES_META_KEY} on the agent-registration "
@@ -575,6 +957,10 @@ async def _seed_agent_registration_bootstrap_key(
             )
         revoked_hashes: list[str] = list(raw_revoked_hashes or [])
         meta_dirty = False
+        for retired in retired_elsewhere:
+            if retired not in revoked_hashes:
+                revoked_hashes.append(retired)
+                meta_dirty = True
 
         if (
             bootstrap_key is None
@@ -607,7 +993,7 @@ async def _seed_agent_registration_bootstrap_key(
                 for row in await api_key_store.get_by_label(
                     session, LEGACY_BOOTSTRAP_KEY_LABEL
                 )
-                if row.type == "registration"
+                if row.type == "registration" and row.tenant_id == key_tenant_id
             ]
             matching_legacy = next(
                 (row for row in legacy_rows if row.key_hash == token_hash), None
@@ -675,8 +1061,12 @@ async def _seed_agent_registration_bootstrap_key(
                 "gateway's API Keys page instead."
             )
         else:
+            # No explicit `tenant_id`: the session is bound to the tenant this
+            # key belongs to, so the column default writes it, the same way
+            # every other scoped insert in the tree does. Naming a constant
+            # here was the shape that only worked while nothing enforced it.
             bootstrap_key = ApiKey(
-                user_id=admin.id,
+                user_id=admin_id,
                 key_hash=token_hash,
                 encrypted_key=encrypted_key,
                 label=BOOTSTRAP_KEY_LABEL,
@@ -693,12 +1083,130 @@ async def _seed_agent_registration_bootstrap_key(
             meta_dirty = True
 
         if meta_dirty:
-            meta = dict(bootstrap_owner.metadata_ or {})
+            # `users` carries no tenant, so the owner row is writable from
+            # this session whichever tenant holds the key. Re-read rather than
+            # carried over from the block above: the object there belonged to
+            # a session that has since closed, and mutating a detached row
+            # persists nothing.
+            owner = await user_store.get(session, bootstrap_owner_id)
+            if owner is None:
+                raise RuntimeError(
+                    "The agent-registration bootstrap owner vanished between "
+                    "being seeded and being updated; this needs a direct "
+                    "database fix."
+                )
+            meta = dict(owner.metadata_ or {})
             meta[BOOTSTRAP_LAST_SEEDED_HASH_META_KEY] = new_last_seeded_hash
             meta[BOOTSTRAP_REVOKED_HASHES_META_KEY] = revoked_hashes
-            bootstrap_owner.metadata_ = meta
+            owner.metadata_ = meta
 
         await session.commit()
+
+
+async def _retire_legacy_keys_outside(
+    session_factory: async_sessionmaker[AsyncSession],
+    api_key_store: ApiKeyStore,
+    tenant_ids: list[str],
+    key_tenant_id: str,
+) -> list[str]:
+    """Retire every legacy admin-owned registration key outside `key_tenant_id`.
+
+    The seeding proper works in one tenant, because the bootstrap key is one
+    per deployment. This sweep cannot: a `type: "registration"` row carrying
+    the legacy label is indistinguishable from a live credential that
+    authenticates as the admin, and one sitting in another tenant goes on
+    doing so. Adoption stays where the key is; retirement goes everywhere,
+    because "no longer authenticates" is not a per-tenant claim.
+
+    Retired rather than deleted, for the reason the seeding gives at length:
+    every consumer already refuses `RETIRED_KEY_TYPE`, so this stops it
+    authenticating exactly as deletion would, while the row stays on the API
+    Keys page with a label saying why. The hashes come back so the bootstrap
+    owner's `revoked_hashes` covers them and restoring an old .env cannot
+    bring one back through the rotation path.
+    """
+    retired: list[str] = []
+    for tenant_id in tenant_ids:
+        if tenant_id == key_tenant_id:
+            continue
+        async with tenant_session(session_factory, tenant_id) as session:
+            stale_rows = [
+                row
+                for row in await api_key_store.get_by_label(
+                    session, LEGACY_BOOTSTRAP_KEY_LABEL
+                )
+                if row.type == "registration" and row.tenant_id == tenant_id
+            ]
+            for stale in stale_rows:
+                stale.type = RETIRED_KEY_TYPE
+                stale.label = f"{stale.label} (retired: stale, no longer authenticates)"
+                retired.append(stale.key_hash)
+                logger.warning(
+                    "Retired a stale admin-owned registration key (id %s) in "
+                    "tenant %s: the deployment's agent-registration bootstrap "
+                    "key lives in tenant %s, so this one authenticates nothing "
+                    "the operator intends and would otherwise keep registering "
+                    "agents with admin authority indefinitely. It is now "
+                    "visible on the API Keys page for a human to review.",
+                    stale.id,
+                    tenant_id,
+                    key_tenant_id,
+                )
+            if stale_rows:
+                await session.commit()
+    return retired
+
+
+async def _bootstrap_key_tenant(
+    session_factory: async_sessionmaker[AsyncSession],
+    api_key_store: ApiKeyStore,
+    tenant_ids: list[str],
+) -> str:
+    """Which tenant holds the deployment's agent-registration bootstrap key.
+
+    The key is one per deployment and `api_keys` is scoped, so "one per
+    deployment" is a claim about a set of per-tenant tables rather than about
+    one table. This asks each tenant in turn and refuses if two answer — the
+    same "expected at most one" rule the seeding already enforced within a
+    tenant, now enforced across them, which is where a second one could
+    actually appear.
+
+    Tenant zero when nobody holds one, because that is where a fresh
+    deployment's key is created. A legacy admin-owned registration row counts
+    as holding it: the seeding is about to adopt or retire that row, and it has
+    to do so in the tenant the row is actually in.
+    """
+    holders: list[str] = []
+    legacy_holders: list[str] = []
+    for tenant_id in tenant_ids:
+        async with tenant_session(session_factory, tenant_id) as session:
+            # Both reads are filtered on the row's own tenant as well: on an
+            # owner connection neither store method narrows by tenant, so
+            # every tenant would look like a holder as soon as one was. See
+            # `db/tenant_lookup.py`.
+            if any(
+                row.tenant_id == tenant_id
+                for row in await api_key_store.get_by_type(session, BOOTSTRAP_KEY_TYPE)
+            ):
+                holders.append(tenant_id)
+            elif any(
+                row.type == "registration" and row.tenant_id == tenant_id
+                for row in await api_key_store.get_by_label(
+                    session, LEGACY_BOOTSTRAP_KEY_LABEL
+                )
+            ):
+                legacy_holders.append(tenant_id)
+    if len(holders) > 1:
+        raise RuntimeError(
+            f"Tenants {sorted(holders)} each hold an agent-registration "
+            "bootstrap key; the key is one per deployment and expected in at "
+            "most one. This needs a direct database fix."
+        )
+    if holders:
+        return holders[0]
+    if legacy_holders:
+        return legacy_holders[0]
+    return TENANT_ZERO_ID
 
 
 async def _shutdown(
@@ -715,27 +1223,94 @@ async def _shutdown(
     await client_lifecycle.stop_all()
     await matrix_admin.close()
 
-    await asyncio.sleep(1)
+    # `should_exit` starts uvicorn's shutdown, which runs the lifespan's
+    # teardown; this sleep is all the time that teardown gets.
+    await asyncio.sleep(_FORCED_EXIT_GRACE_SECONDS)
     logger.info("Forcing exit")
     os._exit(0)
 
 
-def main() -> None:
+async def _migrate_and_grant(config: SwitchConfig) -> None:
+    """Apply pending migrations and reissue the runtime role's grants.
+
+    Migrations still run at boot, on the same schedule as before — what
+    changed is the connection they run on, and the lock now held around both
+    this and the grant re-issue. `migrations/env.py` points Alembic at
+    DB_OWNER_USER where one is configured, because DDL is exactly what the
+    runtime role is not allowed to issue. Where none is, this is unchanged
+    from before and runs as DB_USER, which is right for a developer pointing
+    at a scratch database and fails loudly and immediately for a deployment
+    that has moved to a restricted role without saying who its owner is.
+
+    Held under `db/boot_lock.boot_lock` because a rolling deploy, or a crash
+    racing a restart, starts more than one replica of this process at once,
+    and neither step here tolerates two replicas doing it at the same time:
+    two concurrent `alembic upgrade head` runs contend on the same catalogue
+    locks Postgres itself takes for DDL — the usual result is a deadlock or a
+    "duplicate object" error, not one side quietly winning — and
+    `_prepare_database`'s grant re-issue right after it touches
+    `pg_default_acl`, which two concurrent `ALTER DEFAULT PRIVILEGES`
+    statements contend on the same way. One acquisition covers both rather
+    than two: a table a migration just added is usable only once the grant
+    after it has run, so nothing is served by letting a second replica in
+    between them, and holding the lock across both is simpler than justifying
+    why it would be safe to drop in the gap.
+
+    `alembic_command.upgrade` is synchronous, and `migrations/env.py` calls
+    `asyncio.run` internally to drive its own async engine when it isn't
+    offline — which raises if called from a thread that already has a running
+    event loop. This coroutine has one, so the upgrade runs via
+    `asyncio.to_thread`, on a worker thread that starts with no event loop of
+    its own, which is exactly what that inner `asyncio.run` needs.
+    """
     alembic_ini = Path(__file__).resolve().parent.parent / "alembic.ini"
     alembic_cfg = AlembicConfig(str(alembic_ini))
-    alembic_command.upgrade(alembic_cfg, "head")
+    async with boot_lock(config):
+        await asyncio.to_thread(alembic_command.upgrade, alembic_cfg, "head")
+        await _prepare_database(config)
+    logger.info(
+        "Database migrations applied as %s",
+        config.db_owner_user or config.db_user,
+    )
 
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    switch_log_level = os.environ.get("SWITCH_LOG_LEVEL", "INFO").upper()
-    logging.getLogger().setLevel(log_level)
-    logging.getLogger("switch_core").setLevel(switch_log_level)
 
+def migrate() -> None:
+    """Entry point for migrating a deployment without starting a server.
+
+    Exists so a deploy can bring the schema up in a job of its own, ahead of
+    the pods that will serve on it, and still run *this* code rather than a
+    bare `alembic upgrade head`. The difference is everything `_migrate_and_grant`
+    adds around the upgrade: the boot lock, so the job and a replica that
+    starts while it is running cannot both be applying DDL, and the grant
+    re-issue, without which a table the migration just created is invisible to
+    the runtime role. A job that skipped either would leave the deployment in a
+    state the server then has to repair at boot, one replica at a time.
+
+    Boot runs the same function, and must keep doing so: nothing guarantees a
+    deployment has a migration job, and a developer running the server against
+    a fresh database has none. Running it twice is not wasted work — the second
+    pass finds no pending revisions and re-issues grants that are already
+    correct.
+    """
+    config = SwitchConfig()
     running_version = switch_core_version()
+    configure_logging(config, running_version)
+
+    logger.info("Migrating switch-core %s", running_version or "(version unknown)")
+
+    asyncio.run(_migrate_and_grant(config))
+
+
+def main() -> None:
+    config = SwitchConfig()
+    running_version = switch_core_version()
+    configure_logging(config, running_version)
+
     logger.info("Starting switch-core %s", running_version or "(version unknown)")
 
-    logger.info("Database migrations applied")
+    asyncio.run(_migrate_and_grant(config))
 
-    asyncio.run(run())
+    asyncio.run(run(config))
 
 
 if __name__ == "__main__":

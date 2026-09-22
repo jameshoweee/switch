@@ -6,10 +6,12 @@
   <img src="assets/agent-switch-wordmark.svg" alt="Agent Switch" width="200">
 </picture>
 
-
 **Bring humans and AI agents together in the tools where your team already works**
 
+<a href="https://www.producthunt.com/products/switch-11?embed=true&utm_source=badge-top-post-badge&utm_medium=badge&utm_campaign=badge-switch-14" target="_blank" rel="noopener noreferrer"><img alt="Switch - #1 Product of the Day on Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=1233670&theme=neutral&period=daily"></a>
+
 [![Website](https://img.shields.io/badge/website-flintai.dev-FF895E)](https://www.flintai.dev/products/switch)
+[![Product Hunt](https://img.shields.io/badge/Product%20Hunt-%231%20Product%20of%20the%20Day-FF6154?logo=producthunt&logoColor=white)](https://www.producthunt.com/products/switch-11?launch=switch-14)
 [![License: Apache 2.0 + Commons Clause](https://img.shields.io/badge/license-Apache%202.0%20%2B%20Commons%20Clause-blue)](LICENSE)
 [![Documentation](https://img.shields.io/badge/docs-read-FF895E)](https://docs.flintai.dev/flintai/switch/getting-started)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md)
@@ -276,6 +278,46 @@ dashboard covers the rest.
 **It runs your server.** Point it at your team's Switch server, or have it stand
 one up for you, on this machine or on a host you own, without you writing any
 Compose or Helm configuration.
+
+## Telemetry
+
+Switch Console collects anonymous usage analytics to help us understand how the
+app is used and improve it. Telemetry is **opt-out** — it is on by default, you
+are told about it on first run, and one toggle turns it off. Switch Core (the
+server) sends no telemetry at all.
+
+What we collect:
+
+| Data | Example | Purpose |
+| --- | --- | --- |
+| Event name | `session_started`, `room_created` | Understand which features are used |
+| App version | `0.9.14` | Track adoption of new releases |
+| Release channel | `stable` | Separate pre-release from released usage |
+| Operating system | `darwin`, `23.6.0` | Prioritise platform support |
+| Agent provider | `claude`, `codex` | Understand which agents people run |
+| Outcome and error code | `failure`, `docker_daemon_down` | Prioritise bug fixes |
+| Counts and flags | `agent_count: 3`, `has_initial_prompt: true` | Size features without seeing content |
+| Anonymous client ID | `3f2a9c41-…` (random UUID) | Count unique installations |
+
+Every field is drawn from a fixed vocabulary of enumerated values, numbers and
+booleans — free text cannot be transmitted.
+
+**What we never collect:** source code, prompts, file paths, working
+directories, repository or project names, room or agent names, server URLs or
+hostnames, usernames, emails, API keys or credentials, model outputs, search
+queries, error messages or stack traces, IP addresses, or any personally
+identifiable information.
+
+Events are sent to a relay we operate (`telemetry.flintai.dev`), which forwards
+them to our analytics providers; no vendor credentials ship in the app.
+
+**Opting out:** turn off *Share usage data* on the first-run notice, or in
+Settings → General at any time. Sending stops immediately — the setting is
+checked before every event, so there is no queued backlog.
+
+For the complete field-by-field list of every event, how collection is enforced,
+where the data goes and why it cannot be traced to a person, see
+[`docs/TELEMETRY.md`](docs/TELEMETRY.md).
 
 ## Contributing
 

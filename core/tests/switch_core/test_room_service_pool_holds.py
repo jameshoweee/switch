@@ -6,9 +6,12 @@ for ten seconds, and enough of them at once exhaust the pool and start failing
 heartbeats fleet-wide. So the contract these tests pin is not a count: it is
 that the number of *live* sessions is zero at the moment the Matrix call runs.
 
-They also pin the ordering the split depends on — Matrix membership must never
-exceed what the database records — because that is what makes the resulting
-inconsistency recoverable rather than a silent over-permission.
+They also pin the ordering the split depends on — transport membership must
+never exceed what the database records — because that is what makes the
+resulting inconsistency recoverable rather than a silent over-permission. Both
+ends of that read the same way: grant last, revoke first. Every row that says
+someone is in a room goes before the kick that tells them so, and none is
+written until the transport side is in place.
 """
 
 from __future__ import annotations
@@ -79,7 +82,7 @@ class _RunningClients:
     def get(self, client_id: str) -> Any:
         return self._by_id.get(client_id)
 
-    def get_by_type(self, client_type: str) -> list[Any]:
+    def get_by_type(self, client_type: str, tenant_id: str) -> list[Any]:
         return []
 
 
@@ -238,11 +241,26 @@ class TestRemoveAgentsFromRoom:
         assert [kind for kind, _who, _live in matrix.calls] == ["kick"] * 3
         assert [live for _kind, _who, live in matrix.calls] == [0, 0, 0]
 
-    async def test_the_kick_lands_before_the_row_is_dropped(
+    async def test_the_rows_are_gone_before_the_kick_lands(
         self, session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        # Removal is the mirror of addition: revoke on Matrix first, so the
-        # window is never "joined on Matrix, no membership row".
+        """Both records of the membership go first, then the kick.
+
+        Addition revokes nothing, so it can write the row last; removal has to
+        put every record of the membership beyond reach before it tells anyone,
+        because a client's answer to being kicked is to re-read its rooms.
+        `kick_user` promises exactly that — and keeps it for `client_rooms`
+        alone. `room_agents` is the second record of the same fact, and it is
+        the one `get_rooms_for_agent` reads, which is what the agent bridge
+        applies as membership on every poll. Kicking first left a window where
+        an agent already told to stop still passed that check for the room it
+        had just been removed from.
+
+        The window this opens instead is the harmless one: the rows are gone
+        and the in-memory subscription has not been dropped yet, so every read
+        of membership fails closed, and anything delivered in between is
+        evicted by the removal it is racing.
+        """
         room_id, agent_ids, running = await _seed(session_factory, agents=1)
         tracker = _TrackingSessionFactory(session_factory)
         svc, matrix = _service(tracker, running)
@@ -257,7 +275,7 @@ class TestRemoveAgentsFromRoom:
 
         await svc.remove_agents_from_room(room_id, agent_ids)
 
-        assert seen_at_kick == [agent_ids]
+        assert seen_at_kick == [[]]
         async with session_factory() as session:
             assert await RoomStore().get_agent_ids(session, room_id) == []
 

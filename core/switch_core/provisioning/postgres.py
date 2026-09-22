@@ -99,7 +99,12 @@ class PostgresProvisioning:
                 ClientRoom, {"client_id": client_id, "room_id": switch_room_id}
             )
 
-        if await self._invites.invite(user_id, room_id):
+        # By client id, not `user_id`: `clients.matrix_user_id` is unique per
+        # tenant, and every tenant's admin client carries the same one, so
+        # waking "the client for @switch-admin" would wake whichever tenant's
+        # transport last claimed the slot. `_resolve` above has already turned
+        # the handle into this tenant's client row.
+        if await self._invites.invite(client_id, room_id):
             return
         if existing is not None:
             return
@@ -132,6 +137,13 @@ class PostgresProvisioning:
         its own leaves it reading a room it is no longer in. It is rung after
         the commit so a client that reacts by re-reading its rooms cannot see
         the membership it was just removed from.
+
+        By client id, not `user_id`, for the reason `invite_to_room` spells
+        out: `clients.matrix_user_id` is unique per tenant, so "the client for
+        @switch-admin" names one client per tenant and waking by handle would
+        wake whichever tenant's transport last claimed the slot — here, telling
+        the wrong tenant's client to stop reading a room it is still in while
+        the right one carried on reading a room it is not.
         """
         async with self._session_factory() as session:
             switch_room_id, client_id, _ = await self._resolve(
@@ -139,7 +151,7 @@ class PostgresProvisioning:
             )
             await self._room_store.remove_client(session, client_id, switch_room_id)
             await session.commit()
-        await self._invites.remove(user_id, room_id)
+        await self._invites.remove(client_id, room_id)
 
     async def delete_room(self, room_id: str) -> None:
         """Nothing of its own to discard.
