@@ -26,7 +26,6 @@ import asyncio
 import logging
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from switch_core.bridges.agent.protocol.types import AgentEvent
@@ -34,21 +33,6 @@ from switch_core.observability.catalogue import AGENT_EVENTS_DROPPED
 from switch_core.observability.metrics import metrics
 
 logger = logging.getLogger(__name__)
-
-# The rooms an agent is in, asked for at the moment a read needs them. A long
-# poll can be parked for its whole timeout, so membership taken once up front
-# would be answering a question from before the wait.
-RoomsProvider = Callable[[], Awaitable[set[str]]]
-
-
-def fixed_rooms(rooms: set[str]) -> RoomsProvider:
-    """A provider for a caller whose room set cannot change under it."""
-
-    async def _provider() -> set[str]:
-        return rooms
-
-    return _provider
-
 
 # Maximum events retained per agent. Beyond this the oldest are dropped and the
 # agent is flagged with a gap. Sized for chat-rate traffic: an agent would have
@@ -306,7 +290,7 @@ class EventBuffer:
     # ------------------------------------------------------------------
 
     async def poll(
-        self, agent_id: str, *, rooms: RoomsProvider, timeout: float = 30
+        self, agent_id: str, *, rooms: set[str], timeout: float = 30
     ) -> list[AgentEvent]:
         """Everything queued for this agent in the rooms it is in.
 
@@ -316,10 +300,12 @@ class EventBuffer:
         removed. A default would make the leak the thing a new caller gets for
         free.
 
-        It is asked for rather than passed, because this waits. A set taken
-        before the wait is a set from up to `timeout` ago, so a room the agent
-        joined while the call was parked would have its first events filtered
-        out of the very poll the arrival woke.
+        Read once, before the wait. A room the agent is added to while this is
+        parked has its first events held back to the next poll, which the
+        caller makes immediately; asking the caller to re-read membership
+        mid-poll would buy that one round trip at the cost of a callback
+        reaching back out of the buffer, and this stays behind the narrow
+        surface described at the top of the module.
         """
         return await self._legacy_poll(
             agent_id, "legacy:all", timeout=timeout, rooms=rooms
@@ -332,11 +318,11 @@ class EventBuffer:
             agent_id,
             f"legacy:room:{room_id}",
             timeout=timeout,
-            rooms=fixed_rooms({room_id}),
+            rooms={room_id},
         )
 
     async def poll_notifications(
-        self, agent_id: str, *, rooms: RoomsProvider, timeout: float = 30
+        self, agent_id: str, *, rooms: set[str], timeout: float = 30
     ) -> list[AgentEvent]:
         """The notifiable half of `poll`, under the same membership rule.
 
@@ -357,18 +343,16 @@ class EventBuffer:
         reader_id: str,
         *,
         timeout: float,
-        rooms: RoomsProvider,
+        rooms: set[str],
         notifiable_only: bool = False,
     ) -> list[AgentEvent]:
-        in_rooms = await rooms()
-        events = self._legacy_take(agent_id, reader_id, in_rooms, notifiable_only)
+        events = self._legacy_take(agent_id, reader_id, rooms, notifiable_only)
         if events:
             return events
 
         await self.wait(agent_id, timeout)
 
-        in_rooms = await rooms()
-        return self._legacy_take(agent_id, reader_id, in_rooms, notifiable_only)
+        return self._legacy_take(agent_id, reader_id, rooms, notifiable_only)
 
     def _legacy_take(
         self,

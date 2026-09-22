@@ -2030,7 +2030,7 @@ class ProtocolService:
         return await self.event_buffer.poll(
             agent_id,
             timeout=timeout,
-            rooms=lambda: self._rooms_agent_is_in(agent_id),
+            rooms=await self._rooms_agent_is_in(agent_id),
         )
 
     async def poll_notifications(
@@ -2053,7 +2053,7 @@ class ProtocolService:
         return await self.event_buffer.poll_notifications(
             agent_id,
             timeout=timeout,
-            rooms=lambda: self._rooms_agent_is_in(agent_id),
+            rooms=await self._rooms_agent_is_in(agent_id),
         )
 
     async def touch_watch_heartbeat(self, agent_id: str) -> None:
