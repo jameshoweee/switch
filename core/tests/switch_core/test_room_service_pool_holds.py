@@ -279,6 +279,56 @@ class TestRemoveAgentsFromRoom:
         async with session_factory() as session:
             assert await RoomStore().get_agent_ids(session, room_id) == []
 
+    async def test_both_records_of_the_membership_go_in_one_transaction(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """What makes the rows-first order safe against a crash, not just a race.
+
+        The order this reverses was given its direction by CHOO's transaction
+        split (af41b8e9): "Matrix membership must never exceed what the database
+        records", so that a crash between the two halves leaves an agent
+        under-privileged rather than reading a room Switch has no record of it
+        being in. That reasoning rests on Matrix being a second, independent
+        store of membership that survives the crash.
+
+        There is no second store any more. `PostgresProvisioning` is the only
+        implementation of the port, so what `kick_user` revokes is the
+        `client_rooms` row and an in-memory subscription that dies with the
+        process. The dangerous state the invariant protected against is
+        therefore unreachable from this order — provided the two rows that
+        record the membership go together, which is what this pins. Split
+        across two commits, a crash between them would leave `room_agents`
+        saying the agent is a member after `client_rooms` says it is not, and
+        that is the stale-membership read the poll paths apply.
+        """
+        room_id, agent_ids, running = await _seed(session_factory, agents=2)
+        tracker = _TrackingSessionFactory(session_factory)
+        svc, matrix = _service(tracker, running)
+        await svc.add_agents_to_room(room_id, agent_ids=agent_ids)
+
+        # Every state the rows are seen in, sampled from a separate connection
+        # on each commit the service makes.
+        seen: list[tuple[int, int]] = []
+
+        async def _sample() -> None:
+            async with session_factory() as probe:
+                agents = await RoomStore().get_agent_ids(probe, room_id)
+                clients = await RoomStore().get_client_ids(probe, room_id)
+            seen.append((len(agents), len(clients)))
+
+        async def _kick(matrix_room_id: str, matrix_user_id: str) -> None:
+            await _sample()
+
+        matrix.kick_user = _kick  # type: ignore[method-assign]
+        await svc.remove_agents_from_room(room_id, agent_ids)
+        await _sample()
+
+        # Never observed with one record of the membership gone and the other
+        # still present — the state a crash between two commits would strand.
+        assert all(a == 0 and c == 0 for a, c in seen), (
+            f"the two membership records were observed out of step: {seen}"
+        )
+
 
 class TestDeleteRoom:
     async def test_no_session_is_open_across_the_teardown(

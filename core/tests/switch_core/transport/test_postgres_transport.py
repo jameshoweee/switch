@@ -40,7 +40,7 @@ from switch_core.transport import (
 )
 from switch_core.transport.ephemeral import EphemeralBus
 from switch_core.transport.invites import InviteBus
-from switch_core.transport.postgres import PostgresTransport
+from switch_core.transport.postgres import _DELIVERY_PAGE, PostgresTransport
 from tests.conftest import RLSHarness
 
 
@@ -1837,3 +1837,117 @@ class TestBeingRemovedFromARoom:
         await removed._watch(room)
 
         assert room_id in removed._watching
+
+    async def test_a_removal_on_a_page_boundary_stops_the_next_page(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The between-pages guard, which a removal inside a page never reaches.
+
+        A room that moved a long way while a handler was busy is read in
+        bounded steps. A removal landing anywhere but the last row of a page is
+        caught by the per-row check and the loop never comes back — so to reach
+        the top of the loop at all, the kick has to land on the page boundary
+        exactly, with a full page read and the loop about to ask for another.
+
+        Reading the cursor with `.get` is what makes that arrival safe:
+        `_unwatch` pops it, so indexing would raise KeyError, and the drain
+        would be recorded as a delivery failure rather than a removal being
+        honoured — the room stops either way, but one of them pages someone.
+        """
+        room_id, room, leaving, staying = await self._two_in_a_room(session_factory)
+        listener = _FakeListener()
+        invites = InviteBus()
+        provisioning = self._provisioning(session_factory, invites)
+        delivered: list[str] = []
+
+        member = _transport(
+            session_factory,
+            client_id=staying[0],
+            user_id=staying[1],
+            listener=listener,
+            invites=invites,
+        )
+        member.register_handlers(_Received().handlers())
+
+        async def _kick_on_the_page_boundary(_room_ref, event) -> None:
+            delivered.append(event.body)
+            if len(delivered) == _DELIVERY_PAGE:
+                await provisioning.kick_user(room, leaving[1])
+
+        removed = _transport(
+            session_factory,
+            client_id=leaving[0],
+            user_id=leaving[1],
+            listener=listener,
+            invites=invites,
+        )
+        removed.register_handlers(
+            _Received().handlers(on_message=_kick_on_the_page_boundary)
+        )
+        self._tasks.append(asyncio.create_task(removed.receive_forever()))
+        self._tasks.append(asyncio.create_task(member.receive_forever()))
+        await _watched_room(removed)
+        await _watched_room(member)
+
+        # More than one page, so the loop would come back for another.
+        for i in range(_DELIVERY_PAGE + 25):
+            await member.send_message(room, f"line {i}", sender_name="agent one")
+        await listener.announce(room_id)
+
+        # The whole of page one, and none of page two.
+        assert delivered == [f"line {i}" for i in range(_DELIVERY_PAGE)]
+        assert room_id not in removed._watching
+        assert room_id not in removed._cursors
+        assert "Delivery failed" not in caplog.text, (
+            "the drain came back for another page and fell over the popped "
+            "cursor instead of noticing the removal"
+        )
+
+    async def test_a_restart_does_not_deafen_the_new_loop_to_removals(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """A client row can have two receive loops briefly overlapping.
+
+        The older one unregisters from its `finally`, which runs whenever that
+        loop ends — including after a newer instance took the slot. Giving the
+        slot up by id alone would take the live loop's removal listener with
+        it, and a kick would then reach nobody: no membership row for the
+        caller to write instead, and a transport still delivering a room it is
+        not in.
+        """
+        room_id, room, leaving, _staying = await self._two_in_a_room(session_factory)
+        invites = InviteBus()
+
+        def _make() -> PostgresTransport:
+            t = _transport(
+                session_factory,
+                client_id=leaving[0],
+                user_id=leaving[1],
+                listener=_FakeListener(),
+                invites=invites,
+            )
+            t.register_handlers(_Received().handlers())
+            return t
+
+        old, new = _make(), _make()
+        self._tasks.append(asyncio.create_task(old.receive_forever()))
+        await _watched_room(old)
+        self._tasks.append(asyncio.create_task(new.receive_forever()))
+        await _watched_room(new)
+
+        # The older loop finishes unwinding after the newer one took the slot.
+        await old.close()
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if not old._receiving:
+                break
+        assert not old._receiving, "the superseded loop never finished unwinding"
+
+        await self._provisioning(session_factory, invites).kick_user(room, leaving[1])
+
+        assert room_id not in new._watching, (
+            "the superseded transport's teardown deafened the live one: the kick "
+            "reached nobody and it is still delivering a room it is not in"
+        )
