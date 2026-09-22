@@ -647,3 +647,38 @@ async def test_closed_stream_cannot_detach_a_recreated_connection() -> None:
     assert replacement is not conn
     await old.aclose()
     assert registry.beat(AGENT, replacement.id, 0).stream_attached
+
+
+async def test_a_resumed_stream_does_not_replay_a_room_the_agent_was_removed_from() -> (
+    None
+):
+    """The leak this stream had no way of its own to close.
+
+    Membership is checked when a room is claimed and never again, and an
+    `all`-scope connection covers every room no sibling has claimed, so the
+    stream cannot re-derive who is in what — it holds no session to ask with.
+    A supervisor reconnecting with a resumed cursor therefore replayed the
+    whole retained tail of a room the agent had been removed from.
+
+    What closes it is acting on the removal once, where it is known: the
+    room's events leave the buffer and its claim is released, so there is
+    nothing left for any reader to be handed. This asserts the property at the
+    reader that has no other defence.
+    """
+    registry = ConnectionRegistry()
+    buffer = EventBuffer()
+
+    buffer.enqueue(AGENT, ROOM_A, _message("said before the removal"))
+    buffer.enqueue(AGENT, ROOM_B, _message("still a member here", room=ROOM_B))
+
+    # What a kick does, through the two calls `AgentClient.on_removed` makes.
+    buffer.drop_room(AGENT, ROOM_A)
+    registry.release_room_everywhere(AGENT, ROOM_A)
+
+    # The supervisor comes back and resumes from before both events.
+    conn = _open(registry, connection_id="c-resumed", scope="all", cursor=0)
+    stream = event_stream(conn=conn, registry=registry, buffer=buffer)
+    frames = await _take(stream, 2)
+
+    assert frames[1][0] == "message"
+    assert frames[1][1]["payload"]["body"] == "still a member here"

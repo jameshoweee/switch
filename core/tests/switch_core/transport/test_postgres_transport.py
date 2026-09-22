@@ -1798,3 +1798,42 @@ class TestBeingRemovedFromARoom:
                 break
         assert room_id not in removed._watching
         assert room_id not in removed._cursors
+
+    async def test_a_stray_cursor_does_not_make_a_room_unsubscribable(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """The "already watching" guard is a repair, not just an idempotence check.
+
+        `_cursors` and `_watching` are written together and should never
+        disagree — the removal races that used to part them are closed above.
+        But the cost of the guard being on the wrong one is not symmetric: a
+        cursor left behind with no subscription would make every later `_watch`
+        return early, from a re-invite, a `join_room` on a recorded membership,
+        or a reconnect alike, and the client would be a member of the room and
+        permanently silent in it. Keyed on `_watching` — the fact the rest of
+        the class tests — the same divergence repairs itself on the next watch.
+
+        The divergence is forced here rather than provoked, because there is no
+        longer a way to provoke it. That is the point: this pins which of the
+        two maps the guard reads, so a later change cannot quietly move it back
+        to the one that cannot recover.
+        """
+        room_id, room, leaving, _staying = await self._two_in_a_room(session_factory)
+        removed = _transport(
+            session_factory,
+            client_id=leaving[0],
+            user_id=leaving[1],
+            listener=_FakeListener(),
+            invites=InviteBus(),
+        )
+        removed.register_handlers(_Received().handlers())
+        self._tasks.append(asyncio.create_task(removed.receive_forever()))
+        await _watched_room(removed)
+
+        # A subscription dropped without its cursor: the shape the two maps
+        # take when anything writes one and not the other.
+        del removed._watching[room_id]
+
+        await removed._watch(room)
+
+        assert room_id in removed._watching
